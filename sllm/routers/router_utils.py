@@ -15,12 +15,8 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
-import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Dict, Optional
-
-import ray
+from typing import Dict
 
 from sllm.logger import init_logger
 
@@ -53,8 +49,4 @@ class SllmRouter(ABC):
 
     @abstractmethod
     async def inference(self, request_data: dict):
-        pass
-
-    @abstractmethod
-    async def fine_tuning(self, request_data: dict):
         pass

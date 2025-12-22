@@ -17,6 +17,7 @@
 # ---------------------------------------------------------------------------- #
 from contextlib import asynccontextmanager
 
+import uuid
 import ray
 import ray.exceptions
 from fastapi import FastAPI, HTTPException, Request
@@ -94,7 +95,6 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=400, detail="Missing model_name in request body"
             )
-        lora_adapters = body.get("lora_adapters", None)
 
         controller = ray.get_actor("controller")
         if not controller:
@@ -102,48 +102,31 @@ def create_app() -> FastAPI:
                 status_code=500, detail="Controller not initialized"
             )
 
-        if lora_adapters is not None:
-            logger.info(
-                f"Received request to delete LoRA adapters {lora_adapters} on model {model_name}"
-            )
-            await controller.delete.remote(model_name, lora_adapters)
-        else:
-            logger.info(f"Received request to delete model {model_name}")
-            await controller.delete.remote(model_name)
+        logger.info(f"Received request to delete model {model_name}")
+        await controller.delete.remote(model_name)
 
         return {"status": f"deleted model {model_name}"}
 
     async def inference_handler(request: Request, action: str):
         body = await request.json()
         model_name = body.get("model")
+        if body.get("request_id") is None:
+            request_id = str(uuid.uuid4())
+            body["request_id"] = request_id
+        else:
+            request_id = body.get("request_id")
         logger.info(f"Received request for model {model_name}")
         if not model_name:
             raise HTTPException(
                 status_code=400, detail="Missing model_name in request body"
             )
 
-        request_router = ray.get_actor(model_name, namespace="models")
+        cpu_request_router = ray.get_actor(model_name, namespace="cpu_models")
+        gpu_request_router = ray.get_actor(model_name, namespace="gpu_models")
         logger.info(f"Got request router for {model_name}")
 
-        result = request_router.inference.remote(body, action)
+        result = cpu_request_router.inference.remote(body, action)
         return await result
-
-    async def fine_tuning_handler(request: Request):
-        body = await request.json()
-        model_name = body.get("model")
-        logger.info(f"Received fine tuning request for model {model_name}")
-        if not model_name:
-            raise HTTPException(
-                status_code=400, detail="Missing model_name in request body"
-            )
-        controller = ray.get_actor("controller")
-        if not controller:
-            raise HTTPException(
-                status_code=500, detail="Controller not initialized"
-            )
-
-        job_id = await controller.register_ft_job.remote(body)
-        return {"job_id": job_id}
 
     @app.post("/v1/chat/completions")
     async def generate_handler(request: Request):
@@ -152,38 +135,6 @@ def create_app() -> FastAPI:
     @app.post("/v1/embeddings")
     async def embeddings_handler(request: Request):
         return await inference_handler(request, "encode")
-
-    @app.post("/v1/fine-tuning/jobs")
-    async def fine_tuning(request: Request):
-        return await fine_tuning_handler(request)
-
-    @app.get("/v1/fine_tuning/jobs/{fine_tuning_job_id}")
-    async def get_job_status(fine_tuning_job_id: str):
-        if not fine_tuning_job_id:
-            raise HTTPException(
-                status_code=400, detail="Missing fine_tuning_job_id parameter"
-            )
-        controller = ray.get_actor("controller")
-        status = await controller.get_ft_job_status.remote(fine_tuning_job_id)
-        return {
-            "id": fine_tuning_job_id,
-            "object": "fine_tuning.job",
-            "status": status,
-        }
-
-    @app.post("/v1/fine_tuning/jobs/{fine_tuning_job_id}/cancel")
-    async def cancel_job(fine_tuning_job_id: str):
-        if not fine_tuning_job_id:
-            raise HTTPException(
-                status_code=400, detail="Missing fine_tuning_job_id parameter"
-            )
-        controller = ray.get_actor("controller")
-        await controller.cancel_ft_job.remote(fine_tuning_job_id)
-        return {
-            "id": fine_tuning_job_id,
-            "object": "fine_tuning.job",
-            "status": "cancelled",
-        }
 
     @app.get("/v1/models")
     async def get_models():

@@ -36,30 +36,28 @@ logger = init_logger(__name__)
 def start_server(
     host="0.0.0.0",
     port=8343,
-    enable_storage_aware=False,
     enable_migration=False,
 ):
     """Start the SLLM server using Ray and uvicorn."""
     try:
         # Initialize Ray if not already initialized
         if not ray.is_initialized():
-            click.echo("[ℹ] Initializing Ray...")
+            click.echo("Initializing Ray...")
             ray.init()
         else:
-            click.echo("[ℹ] Ray already initialized")
+            click.echo("Ray already initialized")
 
         # Create the FastAPI app
-        click.echo("[ℹ] Creating FastAPI application...")
+        click.echo("Creating FastAPI application...")
         app = create_app()
 
         # Create and start the controller
-        click.echo("[ℹ] Starting SLLM controller...")
+        click.echo("Starting SLLM controller...")
         controller_cls = ray.remote(SllmController)
         controller = controller_cls.options(
             name="controller", num_cpus=1, resources={"control_node": 0.1}
         ).remote(
             {
-                "enable_storage_aware": enable_storage_aware,
                 "enable_migration": enable_migration,
             }
         )
@@ -73,7 +71,7 @@ def start_server(
         uvicorn.run(app, host=host, port=port)
 
     except KeyboardInterrupt:
-        click.echo("[ℹ] Shutting down SLLM server...")
+        click.echo("Shutting down SLLM server...")
         try:
             if "controller" in locals():
                 ray.get(controller.shutdown.remote())
@@ -115,8 +113,6 @@ def deploy_model(
     target=None,
     min_instances=None,
     max_instances=None,
-    enable_lora=None,
-    lora_adapters=None,
     precision=None,
 ):
     default_config_path = os.path.abspath(
@@ -206,38 +202,6 @@ def deploy_model(
         config_data["auto_scaling_config"]["min_instances"] = min_instances
     if max_instances is not None:
         config_data["auto_scaling_config"]["max_instances"] = max_instances
-    if lora_adapters:
-        # Only parse if not already a dict
-        if isinstance(lora_adapters, dict):
-            adapters_dict = lora_adapters
-        else:
-            adapters_dict = {}
-            if isinstance(lora_adapters, str):
-                items = lora_adapters.replace(",", " ").split()
-            elif isinstance(lora_adapters, (list, tuple)):
-                items = []
-                for item in lora_adapters:
-                    items.extend(item.replace(",", " ").split())
-            else:
-                items = [str(lora_adapters)]
-            for module in items:
-                module = module.strip()
-                if not module:
-                    continue
-                if "=" not in module:
-                    print(
-                        f"[ERROR] Invalid LoRA module format: {module}. Expected <name>=<path>."
-                    )
-                    sys.exit(1)
-                name, path = module.split("=", 1)
-                adapters_dict[name] = path
-        config_data.setdefault("backend_config", {})["lora_adapters"] = (
-            adapters_dict
-        )
-    if enable_lora is not None:
-        config_data.setdefault("backend_config", {})["enable_lora"] = (
-            enable_lora
-        )
     if precision:
         config_data.setdefault("backend_config", {})["precision"] = precision
 
@@ -262,7 +226,7 @@ def deploy_model(
 
 
 # ----------------------------- DELETE COMMAND ----------------------------- #
-def delete_model(models, lora_adapters=None):
+def delete_model(models):
     if not models:
         print("[⚠️ WARNING] No model names provided for deletion.")
         return
@@ -270,45 +234,9 @@ def delete_model(models, lora_adapters=None):
     base_url = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8343")
     headers = {"Content-Type": "application/json"}
 
-    if lora_adapters is not None and len(models) > 1:
-        print(
-            "[❌ ERROR] You can only delete one model when using --lora-adapters."
-        )
-        return
-
     for model in models:
         url = f"{base_url.rstrip('/')}/delete"
         data = {"model": model}
-        # Robust lora_adapters parsing (same as deploy)
-        if lora_adapters is not None:
-            # Accept: demo-lora1 demo-lora2 OR demo-lora1=path ...
-            if isinstance(lora_adapters, dict):
-                adapters = lora_adapters
-            else:
-                # flatten and split
-                if isinstance(lora_adapters, str):
-                    items = lora_adapters.replace(",", " ").split()
-                elif isinstance(lora_adapters, (list, tuple)):
-                    items = []
-                    for item in lora_adapters:
-                        items.extend(item.replace(",", " ").split())
-                else:
-                    items = [str(lora_adapters)]
-                # If all items have '=', parse as dict; else, treat as list
-                if all("=" in module for module in items if module.strip()):
-                    adapters = {}
-                    for module in items:
-                        module = module.strip()
-                        if not module:
-                            continue
-                        name, path = module.split("=", 1)
-                        adapters[name] = path
-                else:
-                    # Only adapter names
-                    adapters = [
-                        module.strip() for module in items if module.strip()
-                    ]
-            data["lora_adapters"] = adapters
         try:
             response = requests.post(url, headers=headers, json=data)
             if response.status_code == 200:

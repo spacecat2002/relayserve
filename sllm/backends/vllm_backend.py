@@ -1,42 +1,22 @@
 # ---------------------------------------------------------------------------- #
-#  serverlessllm                                                               #
-#  copyright (c) serverlessllm team 2024                                       #
-#                                                                              #
-#  licensed under the apache license, version 2.0 (the "license");             #
-#  you may not use this file except in compliance with the license.            #
-#                                                                              #
-#  you may obtain a copy of the license at                                     #
-#                                                                              #
-#                  http://www.apache.org/licenses/license-2.0                  #
-#                                                                              #
-#  unless required by applicable law or agreed to in writing, software         #
-#  distributed under the license is distributed on an "as is" basis,           #
-#  without warranties or conditions of any kind, either express or implied.    #
-#  see the license for the specific language governing permissions and         #
-#  limitations under the license.                                              #
+#  Distributed Inference - CPU Backend                                        #
+#  CPU backend that loads weights and starts prefill inference                #
 # ---------------------------------------------------------------------------- #
 import asyncio
-import gc
-import inspect
 import logging
 import os
 import time
 import uuid
 from dataclasses import fields
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from typing import Any, Dict, List, Optional, Union
 
-import torch
 from vllm import (
     AsyncEngineArgs,
     AsyncLLMEngine,
-    EmbeddingRequestOutput,
-    PoolingParams,
-    PromptType,
     RequestOutput,
     SamplingParams,
 )
 from vllm.inputs import TokensPrompt
-from vllm.utils import Counter
 
 from sllm.backends.backend_utils import (
     BackendStatus,
@@ -45,8 +25,7 @@ from sllm.backends.backend_utils import (
 
 logger = logging.getLogger("ray")
 
-
-def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
+def process_output(output: RequestOutput, latency_metrics: Dict[str, Any], model_name: str) -> Dict[str, Any]:
     choices: List[Dict[str, Any]] = [
         {
             "index": idx,
@@ -79,31 +58,8 @@ def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
             + sum(len(result.token_ids) for result in output.outputs),
         },
     }
-    return api_response
 
-
-def process_embedding_output(
-    outputs: List[EmbeddingRequestOutput], model_name: str
-) -> Dict[str, Any]:
-    valid_outputs = [output for output in outputs if output is not None]
-    query_tokens = sum(len(output.prompt_token_ids) for output in valid_outputs)
-    api_response = {
-        "object": "list",
-        "data": [
-            {
-                "object": "embedding",
-                "index": i,
-                "embedding": output.outputs.embedding,
-            }
-            for i, output in enumerate(outputs)
-        ],
-        "model": model_name,
-        "usage": {
-            "query_tokens": query_tokens,
-            "total_tokens": query_tokens,
-        },
-    }
-    return api_response
+    return api_response, latency_metrics
 
 
 class LLMEngineStatusDict:
@@ -134,25 +90,26 @@ class LLMEngineStatusDict:
             return len(self.status_dict)
 
 
-# Note the GPU resource will be decided when the backend is created
 class VllmBackend(SllmBackend):
-    # This class implements every method in vllm.entrypoints.openai.api_server
-    # https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_server.py
-    # except that we use ray.remote instead of @app and we also add a few new methods:
-    # - stop: stops every ongoing request and then stops the backend
-    # - get_current_tokens: returns a list of all ongoing request tokens
-    # - resume_kv_cache: resumes the key-value cache for the given requests
+    """
+    CPU Backend that loads model weights immediately and starts prefill.
+    This backend is used for initial inference while GPU backend loads weights.
+    """
+
     def __init__(
-        self, model: str, backend_config: Optional[Dict[str, Any]] = None
+        self, model: str, device: str, backend_config: Optional[Dict[str, Any]] = None
     ) -> None:
         if backend_config is None:
             raise ValueError("Backend config is missing")
+        if device not in ["cpu", "gpu"]:
+            raise ValueError("Invalid device")
 
         self.status: BackendStatus = BackendStatus.UNINITIALIZED
         self.status_lock = asyncio.Lock()
+        self.model_name = model
+        self.device = device
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
-        # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
         self.enforce_eager = backend_config.get("enforce_eager", False)
         self.enable_prefix_caching = backend_config.get(
@@ -179,14 +136,35 @@ class VllmBackend(SllmBackend):
             storage_path = os.getenv("STORAGE_PATH", "./models")
             model_path = os.path.join(storage_path, "vllm", model)
             filtered_engine_config["model"] = model_path
-            filtered_engine_config["load_format"] = "serverless_llm"
+            filtered_engine_config["load_format"] = "shm"
 
-        # NOTE: Automatic enable prefix cachinging
         filtered_engine_config["enforce_eager"] = self.enforce_eager
         filtered_engine_config["enable_prefix_caching"] = (
             self.enable_prefix_caching
         )
         filtered_engine_config["task"] = self.task
+
+        self.lazy_load = False
+        if filtered_engine_config["load_format"] == "shm":
+            if self.device == "cpu":
+                filtered_engine_config["kv_transfer_config"] = {
+                    "kv_connector": "ShmConnector",
+                    "kv_role": "kv_producer",
+                    "kv_rank": 0
+                }
+            elif self.device == "gpu":
+                filtered_engine_config["lazy_load"] = backend_config.get("lazy_load", False)
+                filtered_engine_config["shm_tp_size"] = backend_config.get("shm_tp_size", 2)
+                filtered_engine_config["kv_transfer_config"] = {
+                    "kv_connector": "ShmConnector",
+                    "kv_role": "kv_consumer",
+                    "kv_rank": 1,
+                    "shm_size": backend_config.get("shm_size", 4293918720),
+                    "shm_num_blocks": backend_config.get("shm_num_blocks", 455),
+                    "shm_block_len": backend_config.get("shm_block_len", 131072),
+                    "shm_tp_size": backend_config.get("shm_tp_size", 2)
+                }
+                self.lazy_load = filtered_engine_config.get("lazy_load", False)
 
         logger.info(
             f"Creating new VLLM engine with config: {filtered_engine_config}"
@@ -195,15 +173,45 @@ class VllmBackend(SllmBackend):
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
 
         self.engine = None
+        self.weights_loaded = False
+
+    async def start_profile(self):
+        await self.engine.start_profile()
+
+    async def stop_profile(self):
+        await self.engine.stop_profile()
 
     async def init_backend(self) -> None:
+        """Initialize the vLLM backend and load model weights."""
+        if self.device == "cpu":
+            os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "64-92|96-124"
+        elif self.device == "gpu":
+            os.sched_setaffinity(0, {126})
+
+        logger.info(f"Initializing vLLM backend on {self.device}...")
         async with self.status_lock:
             if self.status != BackendStatus.UNINITIALIZED:
+                logger.warning("vLLM backend already initialized")
                 return
+            start_time = time.time()
+            # Create engine and load weights
+            if self.lazy_load:
+                logger.info("init engine except load model weigths")
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
+            load_time = time.time() - start_time
+            logger.info(f"vLLM backend initialized in {load_time * 1000:.2f} ms")
             self.status = BackendStatus.RUNNING
 
-    async def generate(self, request_data: Dict[str, Any]):
+    async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
+        if self.device == "cpu" or not self.lazy_load or self.weights_loaded:
+            return
+        start_time = time.perf_counter()
+        await self.engine.lazy_init(start_layer=0, end_layer=end_layer, warmup=warmup)
+        load_time = time.perf_counter() - start_time
+        logger.info(f"Lazy load model weigths in {load_time * 1000:.2f} ms")
+        self.weights_loaded = True
+
+    async def generate(self, request_data: Dict[str, Any], stream: bool = False):
         async with self.status_lock:
             if self.status != BackendStatus.RUNNING:
                 return {"error": "Engine is not running"}
@@ -213,7 +221,7 @@ class VllmBackend(SllmBackend):
         if request_data is None:
             return {"error": "Request data is missing"}
 
-        model_name: str = request_data.pop("model", "vllm-model")
+        model_name: str = request_data.pop("model", self.model_name)
         messages: Dict[Dict[str, str], str] = request_data.pop("messages", [])
         construct_prompt: str = "\n".join(
             [
@@ -245,23 +253,54 @@ class VllmBackend(SllmBackend):
             inputs, sampling_params, request_id
         )
 
-        # TODO stream results
-
-        # Non-stream case
-        final_output = None
-        async for response_output in results_generator:
-            final_output = response_output
-            await self.request_trace.update_status(request_id, response_output)
+        latency_metrics = {}
+        start_time = time.perf_counter()
+        if not stream:
+            start_time = time.perf_counter()
+            final_output = None
+            async for response_output in results_generator:
+                final_output = response_output
+                await self.request_trace.update_status(request_id, response_output)
+            end_time = time.perf_counter()
+            latency_metrics["e2e"] = end_time - start_time
+        else:
+            start_time = time.perf_counter()
+            final_output = None
+            first_chunk_time = None
+            itl_token_count = 0
+            ttft = 0.0
+            itl_list = []
+            most_recent_timestamp = start_time
+            prefill_completed = (
+                request_data["extra_args"]["kv_transfer_params"]["max_num_prefill_compute_tokens"] in [len(inputs), -1]
+            )
+            async for response_output in results_generator:
+                final_output = response_output
+                await self.request_trace.update_status(request_id, response_output)
+                if response_output.outputs:
+                    current_time = time.perf_counter()
+                    if first_chunk_time is None:
+                        first_chunk_time = current_time
+                        if prefill_completed:
+                            ttft = first_chunk_time - start_time
+                    else:
+                        itl_token_count += 1
+                        itl = current_time - most_recent_timestamp
+                        itl_list.append(itl)
+                    most_recent_timestamp = current_time
+            end_time = time.perf_counter()
+            latency_metrics["e2e"] = end_time - start_time
+            latency_metrics["ttft"] = ttft
+            latency_metrics["tpot"] = (end_time - first_chunk_time) / itl_token_count if itl_token_count > 0 else 0.0
+            latency_metrics["itls"] = itl_list if itl_token_count > 0 else []
 
         assert final_output is not None
-
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
-
-        return process_output(final_output, model_name)
+        return process_output(final_output, latency_metrics, model_name)
 
     async def shutdown(self):
-        """Abort all requests and shutdown the backend."""
+        """Shutdown the vLLM backend."""
         async with self.status_lock:
             if self.status == BackendStatus.DELETING:
                 return
@@ -271,14 +310,16 @@ class VllmBackend(SllmBackend):
         requests = await self.request_trace.return_all_request_ids()
         tasks = [self.engine.abort(request_id) for request_id in requests]
         await asyncio.gather(*tasks)
-        if hasattr(self, "engine"):
-            del self.engine
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
 
-    async def stop(self) -> None:
+        if hasattr(self, "engine") and self.engine is not None:
+            print("Shutting down vLLM engine...")
+            self.engine.shutdown()
+            del self.engine
+            self.engine = None
+
+        print("CPU backend shut down")
+
+    async def stop(self):
         """Wait for all requests to finish and shutdown the backend."""
         async with self.status_lock:
             if self.status.value >= BackendStatus.STOPPING.value:
@@ -316,47 +357,5 @@ class VllmBackend(SllmBackend):
             }
             for request_data in request_datas
         ]
-        tasks = [self.generate(inputs) for inputs in constructed_inputs]
+        tasks = [self.generate(inputs, stream=False) for inputs in constructed_inputs]
         await asyncio.gather(*tasks)
-
-    async def encode(self, request_data: Dict[str, Any]):
-        async with self.status_lock:
-            if self.status != BackendStatus.RUNNING:
-                return {"error": "Engine is not running"}
-
-        assert self.engine is not None
-
-        if not request_data:
-            return {"error": "Request data is missing"}
-
-        request_counter: Counter = Counter()
-        pooling_params: PoolingParams = PoolingParams()
-        model_name = request_data.get("model", "vllm-model")
-        query = request_data.get("input", [])
-
-        if not query:
-            return {"error": "No inputs provided"}
-
-        inputs = cast(Union[PromptType, Sequence[PromptType]], query)
-
-        async def process_input(input_data) -> List[EmbeddingRequestOutput]:
-            request_id = str(next(request_counter))
-            res = self.engine.encode(input_data, pooling_params, request_id)
-            return [result async for result in res]
-
-        raw_outputs = await asyncio.gather(
-            *[process_input(input_data) for input_data in inputs],
-            return_exceptions=True,
-        )
-
-        valid_outputs = []
-        for output in raw_outputs:
-            if isinstance(output, Exception):
-                logger.error(f"Error encountered: {output}")
-            else:
-                valid_outputs.extend(output)
-
-        if not valid_outputs:
-            return {"error": "All inputs failed"}
-
-        return process_embedding_output(valid_outputs, model_name)

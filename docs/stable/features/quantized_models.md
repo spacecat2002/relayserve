@@ -90,7 +90,7 @@ Now, create a file named `quantized_deploy_config.json`. This file tells Serverl
     "backend_config": {
         "pretrained_model_name_or_path": "",
         "device_map": "auto",
-        "torch_dtype": "float16",
+        "torch_dtype": "bfloat16",
         "hf_model_class": "AutoModelForCausalLM",
         "quantization_config": {
             "_load_in_4bit": true,

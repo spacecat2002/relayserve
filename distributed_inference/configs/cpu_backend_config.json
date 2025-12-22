@@ -1,0 +1,14 @@
+{
+  "enforce_eager": true,
+  "no_enable_prefix_caching": true,
+  "task": "auto",
+  "dtype": "bfloat16",
+  "load_format": "shm",
+  "tp": 2,
+  "kv_transfer_config": {
+    "kv_connector": "ShmConnector",
+    "kv_role": "kv_producer",
+    "kv_rank": 0
+  }
+}
+

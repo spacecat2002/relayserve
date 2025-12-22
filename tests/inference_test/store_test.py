@@ -28,7 +28,7 @@ def store_and_compare(model_name, storage_path):
         os.makedirs(storage_path, exist_ok=True)
         cache_dir = storage_path / model_name
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float16, trust_remote_code=True
+            model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
         save_model(hf_model, str(cache_dir))
 
@@ -36,7 +36,7 @@ def store_and_compare(model_name, storage_path):
             model_name,
             storage_path=storage_path,
             device_map="auto",
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             fully_parallel=True,
         )
 

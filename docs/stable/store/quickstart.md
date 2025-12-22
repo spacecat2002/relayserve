@@ -61,7 +61,7 @@ from sllm_store.transformers import save_model
 # Load a model from HuggingFace model hub.
 import torch
 from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained('facebook/opt-1.3b', torch_dtype=torch.float16)
+model = AutoModelForCausalLM.from_pretrained('facebook/opt-1.3b', torch_dtype=torch.bfloat16)
 
 # Replace './models' with your local path.
 save_model(model, './models/facebook/opt-1.3b')
@@ -94,7 +94,7 @@ for i in range(num_gpus):
     torch.cuda.synchronize()
 
 start = time.time()
-model = load_model("facebook/opt-1.3b", device_map="auto", torch_dtype=torch.float16, storage_path="./models/", fully_parallel=True)
+model = load_model("facebook/opt-1.3b", device_map="auto", torch_dtype=torch.bfloat16, storage_path="./models/", fully_parallel=True)
 # Please note the loading time depends on the model size and the hardware bandwidth.
 print(f"Model loading time: {time.time() - start:.2f}s")
 
@@ -171,7 +171,7 @@ model_path = os.path.join(storage_path, model_name)
 llm = LLM(
     model=model_path,
     load_format="serverless_llm",
-    dtype="float16"
+    dtype="bfloat16"
 )
 
 prompts = [
@@ -209,7 +209,7 @@ from sllm_store.transformers import save_lora
 # TODO: Load an adapter from HuggingFace model hub.
 <!-- import torch
 from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained('facebook/opt-1.3b', torch_dtype=torch.float16) -->
+model = AutoModelForCausalLM.from_pretrained('facebook/opt-1.3b', torch_dtype=torch.bfloat16) -->
 
 # Replace './models' with your local path.
 save_lora(adapter, './models/facebook/opt-1.3b')
@@ -227,9 +227,9 @@ import time
 import torch
 from sllm_store.transformers import load_model, load_lora
 
-model = load_model("facebook/opt-1.3b", device_map="auto", torch_dtype=torch.float16, storage_path="./models/", fully_parallel=True)
+model = load_model("facebook/opt-1.3b", device_map="auto", torch_dtype=torch.bfloat16, storage_path="./models/", fully_parallel=True)
 
-model = load_lora("facebook/opt-1.3b", adapter_name="demo_lora", adapter_path="ft_facebook/opt-1.3b_adapter1", device_map="auto", torch_dtype=torch.float16, storage_path="./models/")
+model = load_lora("facebook/opt-1.3b", adapter_name="demo_lora", adapter_path="ft_facebook/opt-1.3b_adapter1", device_map="auto", torch_dtype=torch.bfloat16, storage_path="./models/")
 
 # Please note the loading time depends on the base model size and the hardware bandwidth.
 print(f"Model loading time: {time.time() - start:.2f}s")

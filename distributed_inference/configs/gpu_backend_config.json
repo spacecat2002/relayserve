@@ -1,0 +1,15 @@
+{
+    "enforce_eager": true,
+    "task": "auto",
+    "dtype": "bfloat16",
+    "load_format": "shm",
+    "kv_transfer_config": {
+      "kv_connector": "ShmConnector",
+      "kv_role": "kv_consumer",
+      "kv_rank": 0,
+      "shm_size": 4293918720,
+      "shm_num_blocks": 455,
+      "shm_block_len": 131072,
+      "shm_tp_world_size": 2
+    }
+  }

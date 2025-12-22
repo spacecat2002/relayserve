@@ -79,7 +79,7 @@ class FcfsScheduler(SllmScheduler):
                 (time.time(), num_gpus, allocation_result)
             )
         logger.info(f"Model {model_name} added to the loading queue")
-        node_id = await allocation_result
+        node_id = await allocation_result  # 在control_loop中通过set_result设置
         async with self.metadata_lock:
             if model_name not in self.model_instance:
                 self.model_instance[model_name] = {}
@@ -145,6 +145,8 @@ class FcfsScheduler(SllmScheduler):
                 ) in loading_requests:
                     allocated = False
                     for node_id, node_info in worker_nodes.items():
+                        if node_id == "0":  # node0是CPU instance node
+                            continue
                         if node_info["free_gpu"] >= num_gpus:
                             async with self.queue_lock:
                                 # allocation_result was set

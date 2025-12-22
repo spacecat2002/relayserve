@@ -1,0 +1,10 @@
+{
+  "reportMissingImports": false,
+  "reportOptionalMemberAccess": false,
+  "reportAttributeAccessIssue": false,
+  "reportUnknownMemberType": false,
+  "reportGeneralTypeIssues": false,
+  "reportUnknownAttributeType": false,
+  "reportPrivateUsage": false,
+  "typeCheckingMode": "off"
+}

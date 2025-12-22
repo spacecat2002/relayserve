@@ -72,7 +72,7 @@ def main():
     # Load model into memory
     print(f"Loading model {model_name} into memory")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float16, trust_remote_code=True
+        args.model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 

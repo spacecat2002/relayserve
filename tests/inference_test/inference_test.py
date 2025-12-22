@@ -36,7 +36,7 @@ def test_inference(model_name, storage_path):
         model_name,
         storage_path=storage_path,
         device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         fully_parallel=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)

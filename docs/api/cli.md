@@ -182,7 +182,7 @@ sllm deploy --model facebook/opt-1.3b --num-gpus 2 --target 5 --min-instances 1 
     "backend_config": {
         "pretrained_model_name_or_path": "facebook/opt-1.3b",
         "device_map": "auto",
-        "torch_dtype": "float16",
+        "torch_dtype": "bfloat16",
         "hf_model_class": "AutoModelForCausalLM",
         "enable_lora": true,
         "lora_adapters": {
@@ -218,7 +218,7 @@ Then copy it into `config.json`:
     "backend_config": {
         "pretrained_model_name_or_path": "",
         "device_map": "auto",
-        "torch_dtype": "float16",
+        "torch_dtype": "bfloat16",
         "hf_model_class": "AutoModelForCausalLM",
         "quantization_config": {
             "_load_in_4bit": false,

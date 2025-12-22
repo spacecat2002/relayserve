@@ -37,7 +37,7 @@ def get_worker_nodes():
         if resources.get("control_node", 0) > 0:
             continue  # Skip the control node
 
-        for key, value in resources.items():
+        for key in resources.keys():
             if key.startswith("worker_id_"):
                 node_id = key.split("_")[-1]
                 worker_node_info[node_id] = {

@@ -77,7 +77,7 @@ model_nf4 = AutoModelForCausalLM.from_pretrained(
 ```
 
 ## `torch_dtype` (Data Type for Unquantized Layers)
-The `torch_dtype` parameter sets the data type for model layers that are not quantized (e.g. `LayerNorm`). Setting this to `torch.float16` or `torch.bfloat16` can further reduce memory usage. If unspecified, these layers default to `torch.float16`.
+The `torch_dtype` parameter sets the data type for model layers that are not quantized (e.g. `LayerNorm`). Setting this to `torch.bfloat16` or `torch.bbfloat16` can further reduce memory usage. If unspecified, these layers default to `torch.bfloat16`.
 
 ```python
 import torch
@@ -89,11 +89,11 @@ quantization_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4"
 )
 
-# Load model, casting non-quantized layers to float16
+# Load model, casting non-quantized layers to bfloat16
 model_mixed_precision = AutoModelForCausalLM.from_pretrained(
     "facebook/opt-1.3b",
     quantization_config=quantization_config,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map="auto",
 )
 ```

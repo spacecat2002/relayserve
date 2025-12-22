@@ -49,19 +49,6 @@ def cli():
     "--max-instances", type=int, help="Maximum number of model instances"
 )
 @click.option(
-    "--lora-adapters",
-    help=(
-        'List of LoRA adapters, e.g. "demo_lora1=... demo_lora2=..." or "demo_lora1=...,demo_lora2=...". '
-        "Must be wrapped in quotes if using spaces or commas. Each adapter must be in <name>=<path> format."
-    ),
-)
-@click.option(
-    "--enable-lora",
-    is_flag=True,
-    default=False,
-    help="Enable LoRA support for the model",
-)
-@click.option(
     "--precision",
     help="Model precision for quantization (e.g., int8, fp4, nf4)",
 )
@@ -73,8 +60,6 @@ def deploy(
     target,
     min_instances,
     max_instances,
-    lora_adapters,
-    enable_lora,
     precision,
 ):
     """Deploy a model using a config file or model name.
@@ -82,27 +67,6 @@ def deploy(
     Either --model or a config file with a model specified is required.
     Command line options override values from the config file.
     """
-    # ...existing code...
-    adapters_dict = None
-    if lora_adapters:
-        adapters_dict = {}
-        # If it's a string, split by comma or space
-        if isinstance(lora_adapters, str):
-            items = lora_adapters.replace(",", " ").split()
-        elif isinstance(lora_adapters, (list, tuple)):
-            items = []
-            for item in lora_adapters:
-                items.extend(item.replace(",", " ").split())
-        else:
-            items = [str(lora_adapters)]
-        for module in items:
-            if "=" not in module:
-                click.echo(
-                    f"[ERROR] Invalid LoRA module format: {module}. Expected <name>=<path>."
-                )
-                continue
-            name, path = module.split("=", 1)
-            adapters_dict[name] = path
 
     deploy_model(
         model=model,
@@ -112,18 +76,15 @@ def deploy(
         target=target,
         min_instances=min_instances,
         max_instances=max_instances,
-        lora_adapters=adapters_dict,
-        enable_lora=enable_lora,
         precision=precision,
     )
 
 
 @cli.command()
 @click.argument("models", nargs=-1)
-@click.option("--lora-adapters", help="LoRA adapters to delete.")
-def delete(models, lora_adapters):
-    """Delete deployed models, or remove only the LoRA adapters."""
-    delete_model(models, lora_adapters=lora_adapters if lora_adapters else None)
+def delete(models):
+    """Delete deployed models."""
+    delete_model(models)
 
 
 @cli.command()
@@ -137,21 +98,15 @@ def delete(models, lora_adapters):
     "--port", default=8343, type=int, help="Port to run the server on."
 )
 @click.option(
-    "--enable-storage-aware",
-    is_flag=True,
-    help="Enable storage-aware scheduling.",
-)
-@click.option(
     "--enable-migration",
     is_flag=True,
     help="Enable live migration of model instances.",
 )
-def start(host, port, enable_storage_aware, enable_migration):
+def start(host, port, enable_migration):
     """Start the head node of the SLLM cluster."""
     start_server(
         host=host,
         port=port,
-        enable_storage_aware=enable_storage_aware,
         enable_migration=enable_migration,
     )
 
