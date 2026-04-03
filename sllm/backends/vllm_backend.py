@@ -10,6 +10,9 @@ import uuid
 from dataclasses import fields
 from typing import Any, Dict, List, Optional, Union
 
+import ray
+
+
 from vllm import (
     AsyncEngineArgs,
     AsyncLLMEngine,
@@ -29,10 +32,7 @@ def process_output(output: RequestOutput, latency_metrics: Dict[str, Any], model
     choices: List[Dict[str, Any]] = [
         {
             "index": idx,
-            "message": {
-                "role": "assistant",
-                "content": result.text,
-            },
+            "text": result.text,
             "logprobs": result.logprobs,
             "finish_reason": result.finish_reason,
         }
@@ -97,7 +97,7 @@ class VllmBackend(SllmBackend):
     """
 
     def __init__(
-        self, model: str, device: str, backend_config: Optional[Dict[str, Any]] = None
+        self, instance_id: str, model: str, device: str, backend_config: Optional[Dict[str, Any]] = None, runtime_env: Optional[Dict[str, Any]] = None
     ) -> None:
         if backend_config is None:
             raise ValueError("Backend config is missing")
@@ -106,6 +106,7 @@ class VllmBackend(SllmBackend):
 
         self.status: BackendStatus = BackendStatus.UNINITIALIZED
         self.status_lock = asyncio.Lock()
+        self.instance_id = instance_id
         self.model_name = model
         self.device = device
         self.backend_config = backend_config
@@ -144,6 +145,11 @@ class VllmBackend(SllmBackend):
         )
         filtered_engine_config["task"] = self.task
 
+        # 可通过 backend_config 控制 load_method（tokenwise / layerwise）
+        load_method = backend_config.get("load_method", None)
+        if load_method is not None:
+            filtered_engine_config["load_method"] = load_method
+
         self.lazy_load = False
         if filtered_engine_config["load_format"] == "shm":
             if self.device == "cpu":
@@ -166,6 +172,8 @@ class VllmBackend(SllmBackend):
                 }
                 self.lazy_load = filtered_engine_config.get("lazy_load", False)
 
+        self.runtime_env = runtime_env
+
         logger.info(
             f"Creating new VLLM engine with config: {filtered_engine_config}"
         )
@@ -174,6 +182,9 @@ class VllmBackend(SllmBackend):
 
         self.engine = None
         self.weights_loaded = False
+
+        self.gpu_router = ray.get_actor(self.model_name, namespace="gpu_models")
+        self.scheduler = ray.get_actor("model_loading_scheduler")
 
     async def start_profile(self):
         await self.engine.start_profile()
@@ -187,6 +198,9 @@ class VllmBackend(SllmBackend):
             os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "64-92|96-124"
         elif self.device == "gpu":
             os.sched_setaffinity(0, {126})
+            # 设置环境变量
+            if self.runtime_env is not None:
+                os.environ.update(self.runtime_env)
 
         logger.info(f"Initializing vLLM backend on {self.device}...")
         async with self.status_lock:
@@ -202,14 +216,23 @@ class VllmBackend(SllmBackend):
             logger.info(f"vLLM backend initialized in {load_time * 1000:.2f} ms")
             self.status = BackendStatus.RUNNING
 
-    async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
-        if self.device == "cpu" or not self.lazy_load or self.weights_loaded:
-            return
-        start_time = time.perf_counter()
-        await self.engine.lazy_init(start_layer=0, end_layer=end_layer, warmup=warmup)
-        load_time = time.perf_counter() - start_time
-        logger.info(f"Lazy load model weigths in {load_time * 1000:.2f} ms")
+    async def lazy_load_weights(self, layer_idxes: list[int]) -> bool:
+        start_time = time.time()
+        await self.engine.lazy_init(layer_idxes=layer_idxes, no_warmup=False)
+        print(f"DEBUG: GPU weights loaded, id(self)={id(self)}, time={time.time() - start_time}")
         self.weights_loaded = True
+        return True
+
+    async def get_visible_devices(self) -> List[int]:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not visible_devices:
+            # If CUDA_VISIBLE_DEVICES is not set, assume all devices are visible or handled by Ray
+            # For simplicity in this context, we might need a better way to identify devices if not set
+            # But usually Ray sets this.
+            import torch
+            return list(range(torch.cuda.device_count()))
+        
+        return [int(x) for x in visible_devices.split(",") if x.strip()]
 
     async def generate(self, request_data: Dict[str, Any], stream: bool = False):
         async with self.status_lock:
@@ -231,11 +254,11 @@ class VllmBackend(SllmBackend):
             ]
         )
 
-        # If prompt is not provided, construct it from messages
+        input_tokens = request_data.get("input_tokens")
         inputs: Union[str, TokensPrompt] = request_data.pop(
             "prompt", construct_prompt
         )
-        if request_data.get("input_tokens") is not None:
+        if input_tokens is not None:
             inputs = TokensPrompt(
                 prompt_token_ids=request_data.pop("input_tokens"),
             )
@@ -258,11 +281,22 @@ class VllmBackend(SllmBackend):
         if not stream:
             start_time = time.perf_counter()
             final_output = None
+            first_token_notified = False
             async for response_output in results_generator:
                 final_output = response_output
+                # Notify scheduler on first token (for layerwise cold-start readiness)
+                if not first_token_notified and self.device == "gpu" and response_output.outputs:
+                    try:
+                        self.scheduler.notify_first_token_by_instance.remote(
+                            self.instance_id, self.model_name
+                        )
+                    except Exception:
+                        pass
+                    first_token_notified = True
                 await self.request_trace.update_status(request_id, response_output)
             end_time = time.perf_counter()
             latency_metrics["e2e"] = end_time - start_time
+            latency_metrics["output_length"] = len(final_output.outputs[0].token_ids)
         else:
             start_time = time.perf_counter()
             final_output = None
@@ -271,18 +305,25 @@ class VllmBackend(SllmBackend):
             ttft = 0.0
             itl_list = []
             most_recent_timestamp = start_time
-            prefill_completed = (
-                request_data["extra_args"]["kv_transfer_params"]["max_num_prefill_compute_tokens"] in [len(inputs), -1]
-            )
             async for response_output in results_generator:
                 final_output = response_output
+                load_weights_finished = response_output.load_weights_finished
+                if load_weights_finished:
+                    self.gpu_router.notify_weights_loaded.remote(self.instance_id)
                 await self.request_trace.update_status(request_id, response_output)
                 if response_output.outputs:
                     current_time = time.perf_counter()
                     if first_chunk_time is None:
                         first_chunk_time = current_time
-                        if prefill_completed:
-                            ttft = first_chunk_time - start_time
+                        ttft = first_chunk_time - start_time
+                        # Notify scheduler on first token (for layerwise cold-start readiness)
+                        if self.device == "gpu":
+                            try:
+                                self.scheduler.notify_first_token_by_instance.remote(
+                                    self.instance_id, self.model_name
+                                )
+                            except Exception:
+                                pass
                     else:
                         itl_token_count += 1
                         itl = current_time - most_recent_timestamp
@@ -291,8 +332,10 @@ class VllmBackend(SllmBackend):
             end_time = time.perf_counter()
             latency_metrics["e2e"] = end_time - start_time
             latency_metrics["ttft"] = ttft
+            latency_metrics["first_token_time"] = first_chunk_time
             latency_metrics["tpot"] = (end_time - first_chunk_time) / itl_token_count if itl_token_count > 0 else 0.0
             latency_metrics["itls"] = itl_list if itl_token_count > 0 else []
+            latency_metrics["output_length"] = len(final_output.outputs[0].token_ids)
 
         assert final_output is not None
         if not self.trace_debug:
@@ -317,7 +360,7 @@ class VllmBackend(SllmBackend):
             del self.engine
             self.engine = None
 
-        print("CPU backend shut down")
+        print("vllm backend shut down")
 
     async def stop(self):
         """Wait for all requests to finish and shutdown the backend."""
@@ -359,3 +402,8 @@ class VllmBackend(SllmBackend):
         ]
         tasks = [self.generate(inputs, stream=False) for inputs in constructed_inputs]
         await asyncio.gather(*tasks)
+
+    async def update_computing_layers(self, computing_layers: int):
+        if self.device == "gpu" or self.engine_config["load_method"] != "layerwise":
+            return
+        await self.engine.update_computing_layers(computing_layers)

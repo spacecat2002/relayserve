@@ -15,233 +15,153 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
-from typing import Dict
+"""
+MigrationRouter — extends :class:`RoundRobinRouter` with NUMA-aware
+instance migration so that empty (pre-warmed) instances can be relocated
+to free up GPUs on other NUMA nodes, enabling cross-NUMA tensor-parallel
+dispatch.
+
+Migration strategy
+------------------
+When the scheduler detects that all free GPUs on a worker are concentrated
+on a single NUMA node, it suggests migrating an *empty* instance away from
+a non-dominant NUMA node **to** the dominant NUMA (which has spare GPUs).
+This frees a GPU slot on the other NUMA, making the overall free-GPU
+distribution span multiple NUMA nodes — a prerequisite for balanced TP
+placement.
+"""
+import asyncio
+from typing import Dict, List, Optional
 
 import ray
 
-from sllm.inference_instance import start_instance
 from sllm.logger import init_logger
-from sllm.routers.roundrobin_router import RoundRobinRouter
-from sllm.utils import InstanceHandle, InstanceStatus
+
+from .roundrobin_router import RoundRobinRouter
 
 logger = init_logger(__name__)
 
 
 class MigrationRouter(RoundRobinRouter):
-    def __init__(
-        self,
-        model_name: str,
-        resource_requirements: Dict[str, int],
-        backend: str,
-        backend_config: Dict,
-        router_config: Dict,
-    ) -> None:
-        super().__init__(
-            model_name,
-            resource_requirements,
-            backend,
-            backend_config,
-            router_config,
-        )
-        self.migration_record = {}
-        self.migration_delta = self.router_config.get("migration_delta", 20)
+    """Router with NUMA-aware instance migration support.
 
-    async def inference(self, request_data: dict, action: str):
-        async with self.running_lock:
-            if not self.running:
-                return {"error": "Instance stopped"}
+    Overrides the no-op migration hooks in :class:`RoundRobinRouter` with
+    real logic that queries the scheduler for a migration plan and executes
+    it by tearing down the old actor and recreating it on the target GPUs.
+    """
 
-        async with self.request_count_lock:
-            self.request_count += 1
+    # ------------------------------------------------------------------
+    # Override: rebalance hook
+    # ------------------------------------------------------------------
 
-        instance_allocation = self.loop.create_future()
-        await self.request_queue.put(instance_allocation)
-        logger.info(f"Enqueued request for model {self.model_name}")
+    async def _try_rebalance_for_tp(self) -> None:
+        """Ask the scheduler whether an empty instance should be migrated
+        so that free GPUs span more NUMA nodes, then execute the migration.
+        """
+        if self.device != "gpu":
+            return
 
-        instance_id = await instance_allocation
-        logger.info(f"{request_data}, type: {type(request_data)}")
-        async with self.instance_management_lock:
-            if instance_id not in self.ready_instances:
-                logger.error(f"Instance {instance_id} not found")
-                return {"error": "Instance not found"}
-            instance = self.ready_instances[instance_id]
-        # NOTE: `.remote(request_data)` does not work, don't know why.
-        # Looks like a known issue:
-        # https://github.com/ray-project/ray/issues/26283#issuecomment-1780691475
-        if action == "generate":
-            result = await instance.backend_instance.generate.remote(
-                request_data=request_data
-            )
-            if "preempted" in result:
-                logger.debug(f"Preempted request: {result}")
-                target_instance_id = self.migration_record.get(instance_id)
-                if not target_instance_id:
-                    logger.error(f"No target instance found for {instance_id}")
-                    return {"error": "No target instance found"}
-                target_instance = self.ready_instances[target_instance_id]
-                logger.info(
-                    f"Resuming request on target instance: {target_instance_id}"
-                )
-                if "max_tokens" in request_data:
-                    request_data["max_tokens"] -= result["completed_tokens"]
-                result = await target_instance.backend_instance.resume_generate.remote(
-                    request_data=request_data,
-                    current_output=result["current_output"],
-                )
+        tp_size = int(self.resource_requirements.get("num_gpus", 1))
+        if tp_size <= 1:
+            return
 
-        elif action == "encode":
-            result = await instance.backend_instance.encode.remote(
-                request_data=request_data
-            )
-        else:
-            result = {"error": "Invalid action"}
-        logger.info(f"Finished processing request")
-        await instance.add_requests(-1)
-        async with self.request_count_lock:
-            self.request_count -= 1
-        return result
-
-    async def execute_migration_plan(self, migration_plan):
-        logger.info(f"Executing migration plan: {migration_plan}")
-        source_instance = migration_plan.source_instance
-        source_instance_id = source_instance.instance_id
-        target_node_id = migration_plan.target_node_id
-        # start the target_instance on the target node
-        startup_config = {
-            "num_cpus": self.resource_requirements["num_cpus"],
-            "num_gpus": self.resource_requirements["num_gpus"],
-            "resources": {
-                "worker_node": 0.1,
-                f"worker_id_{target_node_id}": 0.1,
-            },
-        }
-        logger.info(f"Startup config: {startup_config}, {self.backend_config}")
-
-        instance_id = self._new_instance_id()
-        logger.info(
-            f"Creating new instance {instance_id} for model {self.model_name}"
-        )
-        # TODO: Add max_queue_length to target_instance
-        target_instance = InstanceHandle(
-            instance_id=instance_id,
-            max_queue_length=10,
-            num_gpu=self.resource_requirements["num_gpus"],
+        plan = await self.model_loading_scheduler.suggest_instance_migration.remote(
+            self.model_name, tp_size
         )
 
-        ret = await self.model_loading_scheduler.mark_resource.remote(
-            self.model_name, instance_id, target_node_id
-        )
-        if not ret:
-            logger.error(
-                f"Failed to mark resource for instance {instance_id} for model {self.model_name}"
-            )
-            return None
+        if not isinstance(plan, dict) or not plan:
+            return
 
-        await start_instance.options(
-            resources={
-                "worker_node": 0.1,
-                f"worker_id_{target_node_id}": 0.1,
-            }
-        ).remote(
-            instance_id,
-            self.backend,
-            self.model_name,
-            self.backend_config,
-            startup_config,
-        )
-        logger.info(
-            f"Started instance {instance_id} for model {self.model_name}"
-        )
-        target_instance.backend_instance = ray.get_actor(instance_id)
-        async with target_instance.lock:
-            target_instance.ready = True
-            target_instance.node_id = target_node_id
-        logger.info(
-            f"Initialized instance {instance_id} for model {self.model_name}"
-        )
-        await target_instance.backend_instance.init_backend.remote()
-        logger.info(
-            f"Initialized backend for instance {instance_id} for model {self.model_name}"
-        )
-        # migrate the tokens from the source_instance (if still running) to the target_instance
-        if source_instance_id not in self.ready_instances:
-            logger.info(f"Instance {source_instance_id} not found")
-            target_instance.ready = False
-            await target_instance.backend_instance.shutdown.remote()
-            ray.kill(target_instance.backend_instance)
-            return None
-        source_instance = self.ready_instances[source_instance_id]
-        migration_iter = 0
-        n_previous_tokens = 0
-        while True:
-            logger.info(f"Migration iteration {migration_iter}")
-            current_tokens = ray.get(
-                source_instance.backend_instance.get_current_tokens.remote()
-            )
-            if not current_tokens:
-                logger.info("No tokens found")
-                break
-            n_current_tokens = len(current_tokens[0])
-            n_delta_tokens = n_current_tokens - n_previous_tokens
+        instance_id: Optional[str] = plan.get("instance_id")
+        target_gpu_ids: List[int] = plan.get("target_gpu_ids", [])
+        if not instance_id or not target_gpu_ids:
+            return
+
+        success = await self._migrate_empty_instance(instance_id, target_gpu_ids)
+        if success:
             logger.info(
-                f"Number of tokens: {n_current_tokens}, delta: {n_delta_tokens}"
+                f"Rebalanced instance {instance_id} to GPUs {target_gpu_ids} "
+                f"for TP={tp_size} NUMA balance"
             )
-            n_previous_tokens = n_current_tokens
-            if n_delta_tokens <= self.migration_delta:
-                logger.info(
-                    "Migration completed: remained "
-                    f"{None if not current_tokens else n_delta_tokens} tokens"
-                )
-                break
-            ray.get(
-                target_instance.backend_instance.resume_kv_cache.remote(
-                    current_tokens
-                )
-            )
-            logger.info(f"Migration iteration {migration_iter} completed")
-            migration_iter += 1
 
-        logger.info(f"Migrated instance {source_instance_id} to {instance_id}")
+    # ------------------------------------------------------------------
+    # Override: actual migration
+    # ------------------------------------------------------------------
+
+    async def _migrate_empty_instance(
+        self, instance_id: str, target_gpu_ids: List[int]
+    ) -> bool:
+        """Migrate an empty (pre-warmed, no weights loaded) instance to
+        *target_gpu_ids* by destroying the old actor and creating a new one.
+
+        Returns ``True`` on success.
+        """
+        # ---- 1. Validate & remove from ready pool -----------------------
         async with self.instance_management_lock:
-            if source_instance_id not in self.ready_instances:
-                # source_instance has been removed
-                logger.error(f"Instance {instance_id} not found")
-                target_instance.ready = False
-                await target_instance.backend_instance.shutdown.remote()
-                ray.kill(target_instance.backend_instance)
-                return None
-            _ = self.ready_instances.pop(source_instance_id)
-            async with source_instance.lock:
-                source_instance.status = False
-            self.ready_instances[instance_id] = target_instance
-            self.migration_record[source_instance_id] = instance_id
-        logger.info(f"Instance {source_instance_id} removed")
-        await source_instance.backend_instance.shutdown.remote()
-        logger.info(f"Shutdown instance {source_instance_id}")
-        ray.kill(source_instance.backend_instance)
-        logger.info(f"Killed instance {source_instance_id}")
-        await self.model_loading_scheduler.deallocate_resource.remote(
-            self.model_name, source_instance_id, self.resource_requirements
+            instance = self.ready_inference_instances.get(instance_id)
+            if instance is None:
+                logger.warning(f"Migration skipped: instance {instance_id} not found")
+                return False
+            if not instance.empty_instance:
+                logger.warning(f"Migration skipped: instance {instance_id} is not empty")
+                return False
+            if self.instance_to_load_status.get(instance_id, False):
+                logger.warning(
+                    f"Migration skipped: instance {instance_id} already loaded weights"
+                )
+                return False
+            if instance.concurrency > 0:
+                logger.warning(
+                    f"Migration skipped: instance {instance_id} has active requests"
+                )
+                return False
+            # Remove from bookkeeping
+            self.ready_inference_instances.pop(instance_id, None)
+            self.instance_to_load_status.pop(instance_id, None)
+
+        # ---- 2. Release old GPU lock (if any) ---------------------------
+        if (
+            self.device == "gpu"
+            and instance.gpu_locked
+            and instance.gpu_group
+            and instance.node_id
+        ):
+            try:
+                await self.model_loading_scheduler.release_gpu_lock.remote(
+                    instance.node_id, instance.gpu_group
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to release GPU lock for migrated instance "
+                    f"{instance_id}: {e}"
+                )
+            instance.gpu_locked = False
+
+        # ---- 3. Tear down old actor -------------------------------------
+        try:
+            await instance.backend_instance.stop.remote()
+            ray.kill(instance.backend_instance)
+        except Exception as e:
+            logger.error(f"Error tearing down instance {instance_id}: {e}")
+
+        # ---- 4. Deallocate old resources --------------------------------
+        if self.device == "gpu":
+            try:
+                await self.model_loading_scheduler.deallocate_resource.remote(
+                    self.model_name,
+                    instance_id,
+                    self._build_deallocate_resources(instance),
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to deallocate resources for instance {instance_id}: {e}"
+                )
+
+        # ---- 5. Create new instance on target GPUs ----------------------
+        await self._create_instance(
+            empty_instance=True, preferred_gpu_ids=target_gpu_ids
         )
-        logger.info(f"Deallocated instance {source_instance_id}")
-        return instance_id
-
-    async def get_instance_status(self, instance_id: str) -> InstanceStatus:
-        logger.info(f"Getting status for instance: {instance_id}")
-        async with self.instance_management_lock:
-            if instance_id not in self.ready_instances:
-                logger.info(f"Instance {instance_id} not found")
-                return None
-            instance = self.ready_instances[instance_id]
-            logger.info(f"Instance: {instance}")
-            instance_status = await instance.get_status()
-            instance_status.model_name = self.model_name
-            current_tokens = (
-                await instance.backend_instance.get_current_tokens.remote()
-            )
-            if current_tokens:
-                instance_status.num_current_tokens = len(current_tokens[0])
-            else:
-                instance_status.num_current_tokens = 0
-            logger.info(f"Instance status: {instance_status}")
-            return instance_status
+        logger.info(
+            f"Migrated empty instance {instance_id} → preferred GPUs {target_gpu_ids}"
+        )
+        return True

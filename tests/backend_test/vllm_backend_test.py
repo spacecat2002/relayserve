@@ -119,7 +119,7 @@ def async_llm_engine():
 
 @pytest.fixture
 def vllm_backend(model_name, backend_config, async_llm_engine):
-    yield VllmBackend(model_name, backend_config)
+    yield VllmBackend(model_name, "cpu", backend_config)
 
 
 def test_init(vllm_backend, backend_config):
@@ -174,7 +174,7 @@ async def test_generate(vllm_backend, async_llm_engine):
 async def test_shutdown(model_name, backend_config, async_llm_engine):
     # Open trace debug to avoid clean the finished request in record map
     backend_config["trace_debug"] = True
-    vllm_backend = VllmBackend(model_name, backend_config)
+    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
     request_data = {
         "model": "test-model",
         "prompt": "user: Hello",
@@ -221,7 +221,7 @@ async def test_stop(vllm_backend, async_llm_engine):
 async def test_get_current_tokens(model_name, backend_config, async_llm_engine):
     # Open trace debug to avoid clean the finished request in record map
     backend_config["trace_debug"] = True
-    vllm_backend = VllmBackend(model_name, backend_config)
+    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
     request_data = [
         {
             "model": "test-model",
@@ -258,7 +258,7 @@ async def test_resume_kv_cache(vllm_backend):
 async def test_encode(backend_config, async_llm_engine, model_name):
     backend_config["enforce_eager"] = True
     backend_config["enable_prefix_caching"] = False
-    vllm_backend = VllmBackend(model_name, backend_config)
+    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
 
     request_data = {"model": "test-model", "input": ["Hi, How are you?"]}
 

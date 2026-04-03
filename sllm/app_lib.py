@@ -121,20 +121,21 @@ def create_app() -> FastAPI:
                 status_code=400, detail="Missing model_name in request body"
             )
 
-        cpu_request_router = ray.get_actor(model_name, namespace="cpu_models")
-        gpu_request_router = ray.get_actor(model_name, namespace="gpu_models")
-        logger.info(f"Got request router for {model_name}")
+        try:
+            controller = ray.get_actor("controller")
+        except ValueError:
+            raise HTTPException(status_code=500, detail="Controller not found")
 
-        result = cpu_request_router.inference.remote(body, action)
-        return await result
+        try:
+            result = await controller.generate_stream.remote(model_name, body)
+            return result
+        except Exception as e:
+            logger.error(f"Error during inference: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/v1/chat/completions")
     async def generate_handler(request: Request):
         return await inference_handler(request, "generate")
-
-    @app.post("/v1/embeddings")
-    async def embeddings_handler(request: Request):
-        return await inference_handler(request, "encode")
 
     @app.get("/v1/models")
     async def get_models():

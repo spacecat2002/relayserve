@@ -156,9 +156,6 @@ class CpuBackend(SllmBackend):
         # Record start time for timing metrics
         stream_start_time = time.perf_counter()
         first_token_time = None
-        token_count = 0
-        prefill_token_count = 0
-        decode_token_count = 0
         generated_text = ""
         generated_token_ids = []
         prompt_token_ids = []
@@ -176,14 +173,9 @@ class CpuBackend(SllmBackend):
                     first_token_time = current_time
                     ttft = first_token_time - stream_start_time
                 else:
-                    token_count += 1
                     # Calculate inter-token latency (ITL)
                     itl = current_time - most_recent_timestamp
                     itl_list.append(itl)
-                
-                # Calculate TPOT (average time per token so far)
-                time_since_first = current_time - first_token_time
-                tpot = time_since_first / token_count if token_count > 0 else 0.0
                 
                 # Extract text and tokens from output
                 text = response_output.outputs[0].text
@@ -198,13 +190,22 @@ class CpuBackend(SllmBackend):
 
         # Calculate final metrics
         if first_token_time is not None:
-            total_time = time.perf_counter() - stream_start_time
-            final_tpot = (time.perf_counter() - first_token_time) / token_count if token_count > 0 else 0.0
-            print(f"CPU TTFT: {first_token_time - stream_start_time}, CPU TPOT: {final_tpot}")
+            end_time = time.perf_counter()
+            output_token_count = len(generated_token_ids)
+            final_tpot = (
+                (end_time - first_token_time) / (output_token_count - 1)
+                if output_token_count > 1
+                else 0.0
+            )
             return {
                 "done": True,
                 "ttft": first_token_time - stream_start_time,
                 "tpot": final_tpot,
+                "generated_text": generated_text,
+                "generated_token_ids": generated_token_ids,
+                "prompt_token_ids": prompt_token_ids,
+                "output_tokens": output_token_count,
+                "computed_tokens": output_token_count + len(prompt_token_ids),
             }
         else:
             return {"done": True, "error": "No tokens generated"}
@@ -250,4 +251,3 @@ class CpuBackend(SllmBackend):
 
     async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
         pass
-

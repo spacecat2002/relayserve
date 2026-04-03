@@ -31,7 +31,7 @@ class SllmRouter(ABC):
         resource_requirements: Dict[str, int],
         backend: str,
         backend_config: Dict,
-        router_config: Dict,
+        device: str,
     ) -> None:
         pass
 
@@ -48,5 +48,5 @@ class SllmRouter(ABC):
         pass
 
     @abstractmethod
-    async def inference(self, request_data: dict):
+    async def inference(self, request_data: dict, action: str):
         pass

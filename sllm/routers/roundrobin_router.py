@@ -17,19 +17,42 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 import logging
+import time
 import uuid
-from typing import Dict, List, Optional
+from collections import deque
+from typing import Dict, List, Optional, Tuple
 
 import ray
 
-from sllm.inference_instance import start_instance
 from sllm.logger import init_logger
 
-from ..utils import InstanceHandle
+from ..utils import InstanceHandle, get_worker_nodes
 from .router_utils import SllmRouter
 
 logger = init_logger(__name__)
 
+
+@ray.remote
+def start_instance(
+    instance_id, backend, model_name, backend_config, startup_config, device
+):
+    logger.info(f"Starting instance {instance_id} with backend {backend}")
+    if backend == "vllm":
+        from sllm.backends import VllmBackend
+        model_backend_cls = VllmBackend
+    else:
+        logger.error(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown backend: {backend}")
+
+    model_actor_cls = ray.remote(model_backend_cls)
+    
+    runtime_env = startup_config.get("runtime_env")
+    return model_actor_cls.options(
+        name=instance_id,
+        **startup_config,
+        max_concurrency=10,
+        lifetime="detached",
+    ).remote(instance_id, model_name, device, backend_config, runtime_env)
 
 async def auto_scaler(
     auto_scaling_metrics: Dict[str, int], auto_scaling_config: Dict[str, int]
@@ -42,7 +65,7 @@ async def auto_scaler(
 
     min_instances = auto_scaling_config.get("min_instances", 0)
     max_instances = auto_scaling_config.get("max_instances", 10)
-    target_ongoing_requests = auto_scaling_config.get("target", 2)
+    target_ongoing_requests = auto_scaling_config.get("target", 10)
 
     desired_instances = (
         request_count + target_ongoing_requests - 1
@@ -62,14 +85,12 @@ class RoundRobinRouter(SllmRouter):
         backend: str,
         backend_config: Dict,
         device: str,
-        gpu_lazy_load: bool = False,
     ) -> None:
         self.model_name = model_name
         self.resource_requirements = resource_requirements
         self.backend = backend
         self.backend_config = backend_config
         self.device = device
-        self.gpu_lazy_load = gpu_lazy_load
 
         self.loop_interval = 1
         self.loop = asyncio.get_running_loop()
@@ -82,6 +103,8 @@ class RoundRobinRouter(SllmRouter):
 
         self.req_to_instance_id: Dict[str, str] = {}
         self.instance_to_load_status: Dict[str, bool] = {}
+
+        self.gpu_lock = asyncio.Lock()
 
         self.auto_scaling_config = {}
         self.auto_scaling_lock = asyncio.Lock()
@@ -96,6 +119,18 @@ class RoundRobinRouter(SllmRouter):
         self.idle_time_lock = asyncio.Lock()
 
         self.auto_scaler = None
+        self.round_robin_index = 0
+        self.request_arrivals = deque()
+
+        self.load_window_seconds = int(
+            self.backend_config.get("load_window_seconds", 120)
+        )
+        self.forecast_horizon_seconds = int(
+            self.backend_config.get("forecast_horizon_seconds", 20)
+        )
+        self.predictive_prewarm_threshold = float(
+            self.backend_config.get("predictive_prewarm_threshold", 0.7)
+        )
         logger.info(f"Created new handler for model {self.model_name}")
 
     async def start(
@@ -106,7 +141,12 @@ class RoundRobinRouter(SllmRouter):
             if self.device == "gpu":
                 async with self.auto_scaling_lock:
                     self.auto_scaling_config = auto_scaling_config
-                await self._create_instance()
+                prewarm = self.backend_config.get(
+                    "prewarm_gpu_instances", 1
+                )
+                for _ in range(prewarm):
+                    await self._try_rebalance_for_tp()
+                    await self._create_instance(empty_instance=True)
                 self.auto_scaler = asyncio.create_task(self._auto_scaler_loop())
                 self.load_balancer = asyncio.create_task(self._load_balancer_loop())
             elif self.device == "cpu":
@@ -130,34 +170,314 @@ class RoundRobinRouter(SllmRouter):
     def _new_instance_id(self):
         pattern = "{model_name}_{id}"
         return pattern.format(model_name=self.model_name, id=uuid.uuid4())
-    
 
-    async def lazy_load_weights(self, request_id: str, end_layer: int = -1, warmup: bool = False):
+    async def _create_instance(
+        self, empty_instance: bool = False, preferred_gpu_ids: Optional[List[int]] = None
+    ):
+        instance_id = self._new_instance_id()
+        logger.info(
+            f"Creating new instance {instance_id} for model {self.model_name}"
+        )
+        # get max_queue_length from auto_scaling_config
+        if self.auto_scaling_config.get("metric", "") == "concurrency":
+            max_request_length = self.auto_scaling_config.get("target", 1)
+        else:
+            max_request_length = 1
+        logger.info(
+            f"Creating new instance {instance_id} for model {self.model_name}, max queue length is {max_request_length}"
+        )
+        instance = InstanceHandle(
+            instance_id=instance_id,
+            max_queue_length=max_request_length,
+            num_gpu=self.resource_requirements["num_gpus"],
+            empty_instance=empty_instance,
+            preferred_gpu_ids=preferred_gpu_ids,
+        )
+        async with self.instance_management_lock:
+            self.starting_inference_instances[instance_id] = instance
+        self.loop.create_task(self._start_instance(instance_id))
+
+        return instance_id
+
+    async def _start_instance(self, instance_id):
+        async with self.instance_management_lock:
+            if instance_id not in self.starting_inference_instances:
+                logger.error(f"Instance {instance_id} not found")
+                return
+            instance = self.starting_inference_instances[instance_id]
+        # Now ask model loading scheduler to load the model
+        logger.info(
+            f"Allocating resources for model {self.model_name} on instance {instance_id}"
+        )
+        backend_config = dict(self.backend_config)
+        if instance.empty_instance:
+            backend_config["lazy_load"] = True
+        if self.device == "gpu":
+            scheduler_resources = dict(self.resource_requirements)
+            scheduler_resources["empty_instance"] = instance.empty_instance
+            tp_size = int(self.resource_requirements.get("num_gpus", 1))
+            if tp_size > 1:
+                scheduler_resources["tp_size"] = tp_size
+            if instance.empty_instance:
+                scheduler_resources["num_gpus"] = 0.001
+            if instance.preferred_gpu_ids:
+                scheduler_resources["preferred_gpu_ids"] = instance.preferred_gpu_ids
+            
+            allocation_info = await self.model_loading_scheduler.allocate_resource.remote(
+                self.model_name, instance_id, scheduler_resources
+            )
+            gpu_ids = []
+            if isinstance(allocation_info, dict):
+                startup_node = allocation_info.get("node_id")
+                gpu_ids = allocation_info.get("gpu_ids", [])
+            else:
+                startup_node = allocation_info
+            
+            startup_resources = {
+                "gpu_worker_node": 0.001,
+                f"worker_id_{startup_node}": 0.001,
+            }
+            num_gpus = 0.001
+        else:
+            startup_node = None
+            gpu_ids = []
+            startup_resources = {
+                "cpu_worker_node": 0.001,
+            }
+            num_gpus = 0
+        startup_config = {
+            "resources": startup_resources,
+            "num_gpus": num_gpus,
+        }
+        logger.info(f"Startup config: {startup_config}, {backend_config}")
+
+        if gpu_ids:
+            runtime_env = {"env_vars": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, gpu_ids))}}
+            startup_config["runtime_env"] = runtime_env
+            instance.gpu_group = gpu_ids
+            logger.info(f"Assigned GPU group {gpu_ids} to instance {instance_id}")
+
+        await start_instance.options(resources=startup_resources).remote(
+            instance_id,
+            self.backend,
+            self.model_name,
+            backend_config,
+            startup_config,
+            self.device,
+        )
+        logger.info(
+            f"Started instance {instance_id} for model {self.model_name}"
+        )
+        instance.backend_instance = ray.get_actor(instance_id)
+        async with instance.lock:
+            instance.ready = True
+            instance.node_id = startup_node
+        await instance.backend_instance.init_backend.remote()
+        
+        # Get visible devices and store in instance handle
+        if self.device == "gpu":
+            gpu_ids = await instance.backend_instance.get_visible_devices.remote()
+            async with instance.lock:
+                instance.gpu_group = gpu_ids
+                logger.info(f"Instance {instance_id} initialized on GPUs {gpu_ids}")
+
+        async with self.instance_management_lock:
+            self.ready_inference_instances[instance_id] = instance
+            self.starting_inference_instances.pop(instance_id)
+            if self.device == "gpu":
+                lazy_load = backend_config.get("lazy_load", False)
+                self.instance_to_load_status[instance_id] = (
+                    False if lazy_load else True
+                )
+        return instance_id
+
+    def _build_deallocate_resources(self, instance: InstanceHandle) -> Dict:
+        resources = dict(self.resource_requirements)
+        if self.device == "gpu":
+            if instance.empty_instance:
+                resources["num_gpus"] = 0.001
+                resources["tp_size"] = self.resource_requirements.get("num_gpus", 1)
+        return resources
+
+    async def _predictive_load_stats(self) -> Dict[str, float]:
+        now = time.time()
+        while self.request_arrivals and self.request_arrivals[0] < now - self.load_window_seconds:
+            self.request_arrivals.popleft()
+        short_window = min(30, self.load_window_seconds)
+        short_count = len([ts for ts in self.request_arrivals if ts >= now - short_window])
+        long_count = len(self.request_arrivals)
+        short_rate = short_count / max(float(short_window), 1.0)
+        long_rate = long_count / max(float(self.load_window_seconds), 1.0)
+        trend = short_rate - long_rate
+        predicted_rate = max(0.0, short_rate + trend)
+        predicted_requests = predicted_rate * self.forecast_horizon_seconds
+        return {
+            "short_rate": short_rate,
+            "long_rate": long_rate,
+            "trend": trend,
+            "predicted_requests": predicted_requests,
+        }
+
+    async def _try_rebalance_for_tp(self):
+        """Hook for subclasses (e.g. MigrationRouter) to rebalance GPU
+        placement across NUMA nodes before creating a TP instance.
+
+        The default implementation is a no-op.
+        """
+        pass
+
+    async def _migrate_empty_instance(
+        self, instance_id: str, target_gpu_ids: List[int]
+    ) -> bool:
+        """Hook for subclasses to migrate an empty instance to *target_gpu_ids*.
+
+        The default implementation is a no-op that returns ``False``.
+        """
+        return False
+
+    async def _stop_instance(self, instance_id: Optional[str] = None):
+        while len(self.ready_inference_instances) <= 0:
+            await asyncio.sleep(1)
+
+        async with self.instance_management_lock:
+            if instance_id is None:
+                instance_id, instance = self.ready_inference_instances.popitem()
+            elif instance_id in self.ready_inference_instances:
+                instance = self.ready_inference_instances.pop(instance_id)
+            else:
+                logger.error(f"Instance {instance_id} not found")
+                return
+            self.deleting_inference_instances[instance_id] = instance
+        logger.info(
+            f"Stopping instance {instance_id} for model {self.model_name}"
+        )
+        self.loop.create_task(self._finish_instance(instance_id))
+
+    async def _finish_instance(self, instance_id: str):
+        async with self.instance_management_lock:
+            if instance_id not in self.deleting_inference_instances:
+                logger.error(f"Instance {instance_id} not found")
+                return
+            instance = self.deleting_inference_instances.pop(instance_id)
+        async with instance.lock:
+            instance.status = False
+        
+        # Release GPU lock if held
+        if self.device == "gpu" and instance.gpu_locked and instance.gpu_group and instance.node_id:
+            try:
+                await self.model_loading_scheduler.release_gpu_lock.remote(
+                    instance.node_id, instance.gpu_group
+                )
+                logger.info(f"Released GPU lock for instance {instance_id}")
+            except Exception as e:
+                logger.error(f"Failed to release GPU lock for instance {instance_id}: {e}")
+            instance.gpu_locked = False
+
+        await instance.backend_instance.stop.remote()
+        ray.kill(instance.backend_instance)
+        if self.device == "gpu":
+            await self.model_loading_scheduler.deallocate_resource.remote(
+                self.model_name,
+                instance_id,
+                self._build_deallocate_resources(instance),
+            )
+
+    async def _shutdown_instance(self, instance_id: str):
+        logger.info(
+            f"Force deleting an instance (even if it is busy) for model {self.model_name}"
+        )
+        async with self.instance_management_lock:
+            pool = self.ready_inference_instances
+            if instance_id not in pool:
+                logger.error(f"Instance {instance_id} not found")
+                return
+            instance = pool.pop(instance_id)
+            async with instance.lock:
+                instance.status = False
+        
+        # Release GPU lock if held
+        if self.device == "gpu" and instance.gpu_locked and instance.gpu_group and instance.node_id:
+            try:
+                await self.model_loading_scheduler.release_gpu_lock.remote(
+                    instance.node_id, instance.gpu_group
+                )
+                logger.info(f"Released GPU lock for instance {instance_id}")
+            except Exception as e:
+                logger.error(f"Failed to release GPU lock for instance {instance_id}: {e}")
+            instance.gpu_locked = False
+
+        await instance.backend_instance.shutdown.remote()
+        ray.kill(instance.backend_instance)
+        if self.device == "gpu":
+            await self.model_loading_scheduler.deallocate_resource.remote(
+                self.model_name,
+                instance_id,
+                self._build_deallocate_resources(instance),
+            )
+        return
+
+    async def lazy_load_weights(
+        self,
+        layer_idxes: List[int],
+        load_method: str = "tokenwise",
+        request_id: Optional[str] = None,
+    ):
         if self.device == "cpu":
             return
 
         async with self.idle_time_lock:
             self.idle_time = 0
 
-        instance_allocation = self.loop.create_future()
-        await self.request_queue.put(instance_allocation)
-        logger.info(f"lazy load weights for model {self.model_name}")
-        instance_id = await instance_allocation
+        # Try to find an existing instance to load weights
+        # If all instances are busy (GPU locked), wait or create new one
+        instance_id = None
+        while instance_id is None:
+            # Check existing empty instances
+            potential_instances = []
+            async with self.instance_management_lock:
+                for i_id, instance in self.ready_inference_instances.items():
+                    if self.instance_to_load_status.get(i_id, False) == False:
+                        potential_instances.append(instance)
+            
+            # Try to lock GPU for an instance
+            async with self.gpu_lock:
+                for instance in potential_instances:
+                    async with instance.lock:
+                        if instance.gpu_group and instance.node_id:
+                            # Try to acquire global GPU lock
+                            lock_acquired = await self.model_loading_scheduler.acquire_gpu_lock.remote(
+                                instance.node_id, instance.gpu_group
+                            )
+                            if lock_acquired:
+                                instance.gpu_locked = True
+                                instance_id = instance.instance_id
+                                logger.info(f"Locked GPUs {instance.gpu_group} on node {instance.node_id} for instance {instance_id}")
+                                break
+            
+            if instance_id is None:
+                # No available instance, wait or trigger scaling (not implemented here)
+                logger.info("No available GPU slots for loading weights, waiting...")
+                await asyncio.sleep(0.1)
 
         async with self.instance_management_lock:
             if instance_id not in self.ready_inference_instances:
                 logger.error(f"Instance {instance_id} not found")
                 return
             instance = self.ready_inference_instances[instance_id]
-            self.req_to_instance_id[request_id] = instance_id
+            if request_id is not None:
+                self.req_to_instance_id[request_id] = instance_id
             logger.info(f"Lazy load weights request for model {self.model_name}")
             
-        await instance.backend_instance.lazy_load_weights.remote(end_layer, warmup)
+        await instance.backend_instance.lazy_load_weights.remote(layer_idxes)
+        if load_method == "tokenwise":
+            await self.notify_weights_loaded(instance_id)
 
+
+    async def notify_weights_loaded(self, instance_id: str):
+        logger.info(f"Received weight loading notification for instance {instance_id}")
         async with self.instance_management_lock:
             self.instance_to_load_status[instance_id] = True
             logger.info(f"Lazy load weights request for model {self.model_name} completed")
-
 
     async def get_load_status(self, request_id: str):
         instance_id = self.req_to_instance_id.get(request_id, None)
@@ -166,12 +486,25 @@ class RoundRobinRouter(SllmRouter):
         async with self.instance_management_lock:
             return self.instance_to_load_status.get(instance_id, False)
 
+    async def has_loaded_instance(self) -> bool:
+        async with self.instance_management_lock:
+            for instance_id in self.ready_inference_instances.keys():
+                if self.instance_to_load_status.get(instance_id, False):
+                    return True
+        return False
+
+    async def get_instance(self):
+        async with self.instance_management_lock:
+            for instance_id in self.ready_inference_instances.keys():
+                return self.ready_inference_instances[instance_id]
+        return None
 
     async def inference(self, request_data: dict, action: str):
         async with self.running_lock:
             if not self.running:
                 return {"error": "Instance stopped"}
 
+        self.request_arrivals.append(time.time())
         async with self.request_count_lock:
             self.request_count += 1
 
@@ -185,6 +518,8 @@ class RoundRobinRouter(SllmRouter):
                 await self.request_queue.put(instance_allocation)
                 logger.info(f"Enqueued {action} request for model {self.model_name}")
                 instance_id = await instance_allocation
+            if instance_id is None:
+                return {"error": "Instance cancelled"}
 
         elif self.device == "cpu":
             instance_id = self.cpu_instance_id
@@ -217,8 +552,8 @@ class RoundRobinRouter(SllmRouter):
         # stop all inference instances
         # return all unfinished requests
         while not self.request_queue.empty():
-            request_data, done_event = await self.request_queue.get()
-            done_event.set_result({"error": "Instance cancelled"})
+            instance_allocation = await self.request_queue.get()
+            instance_allocation.set_result(None)
 
         async with self.instance_management_lock:
             deleted_instance_id = list(self.ready_inference_instances.keys())
@@ -231,8 +566,6 @@ class RoundRobinRouter(SllmRouter):
         return deleted_instance_id
 
     async def _load_balancer_loop(self):
-        # this is a simple round-robin load balancer
-        round_robin_index = 0
         while True:
             instance_allocation = await self.request_queue.get()
             allocated = False
@@ -249,9 +582,9 @@ class RoundRobinRouter(SllmRouter):
                     logger.info(f"{instance_options}")
                 logger.info(f"Got ready instances {instance_options}")
                 instance_id = instance_options[
-                    round_robin_index % len(instance_options)
+                    self.round_robin_index % len(instance_options)
                 ]
-                round_robin_index += 1
+                self.round_robin_index += 1
                 async with self.instance_management_lock:
                     if instance_id not in self.ready_inference_instances:
                         continue
@@ -275,10 +608,22 @@ class RoundRobinRouter(SllmRouter):
                 auto_scaling_config = self.auto_scaling_config.copy()
             async with self.request_count_lock:
                 request_count = self.request_count
+            await self.model_loading_scheduler.report_model_load.remote(
+                self.model_name,
+                float(request_count),
+            )
             auto_scaling_metrics = {"request_count": request_count}
             desired_instances = await auto_scaler(
                 auto_scaling_metrics, auto_scaling_config
             )
+            predictive_stats = await self._predictive_load_stats()
+            target_per_instance = max(float(auto_scaling_config.get("target", 1)), 1.0)
+            predicted_instances = int(
+                (predictive_stats["predicted_requests"] + target_per_instance - 1)
+                // target_per_instance
+            )
+            if predictive_stats["predicted_requests"] > 0:
+                desired_instances = max(desired_instances, predicted_instances)
             async with self.instance_management_lock:
                 num_running_instances = len(
                     self.starting_inference_instances
@@ -289,6 +634,7 @@ class RoundRobinRouter(SllmRouter):
             )
             if desired_instances > num_running_instances:
                 logger.info("Creating new instance")
+                await self._try_rebalance_for_tp()
                 await self._create_instance()
             elif desired_instances < num_running_instances:
                 keep_alive = auto_scaling_config.get("keep_alive", 0)
@@ -306,136 +652,21 @@ class RoundRobinRouter(SllmRouter):
                     async with self.idle_time_lock:
                         self.idle_time += self.loop_interval
             else:
-                # logger.info("No scaling needed")
-                pass
+                async with self.instance_management_lock:
+                    empty_instance_count = sum(
+                        1
+                        for instance in self.ready_inference_instances.values()
+                        if instance.empty_instance
+                        and not self.instance_to_load_status.get(
+                            instance.instance_id, False
+                        )
+                    )
+                predicted_ratio = predictive_stats["predicted_requests"] / target_per_instance
+                if (
+                    self.device == "gpu"
+                    and predicted_ratio > num_running_instances * self.predictive_prewarm_threshold
+                    and empty_instance_count == 0
+                ):
+                    await self._try_rebalance_for_tp()
+                    await self._create_instance(empty_instance=True)
             await asyncio.sleep(self.loop_interval)
-
-    async def _create_instance(self):
-        instance_id = self._new_instance_id()
-        logger.info(
-            f"Creating new instance {instance_id} for model {self.model_name}"
-        )
-        # get max_queue_length from auto_scaling_config
-        if self.auto_scaling_config.get("metric", "") == "concurrency":
-            max_request_length = self.auto_scaling_config.get("target", 1)
-        else:
-            max_request_length = 1
-        logger.info(
-            f"Creating new instance {instance_id} for model {self.model_name}, max queue length is {max_request_length}"
-        )
-        instance = InstanceHandle(
-            instance_id=instance_id,
-            max_queue_length=max_request_length,
-            num_gpu=self.resource_requirements["num_gpus"],
-        )
-        async with self.instance_management_lock:
-            self.starting_inference_instances[instance_id] = instance
-        self.loop.create_task(self._start_instance(instance_id))
-
-        return instance_id
-
-    async def _start_instance(self, instance_id):
-        async with self.instance_management_lock:
-            if instance_id not in self.starting_inference_instances:
-                logger.error(f"Instance {instance_id} not found")
-                return
-            instance = self.starting_inference_instances[instance_id]
-        # Now ask model loading scheduler to load the model
-        logger.info(
-            f"Allocating resources for model {self.model_name} on instance {instance_id}"
-        )
-        startup_node = (
-            await self.model_loading_scheduler.allocate_resource.remote(
-                self.model_name, instance_id, self.resource_requirements
-            )
-        ) if self.device == "gpu" else 0
-        startup_config = {
-            "num_cpus": self.resource_requirements["num_cpus"],
-            "num_gpus": self.resource_requirements["num_gpus"],
-            "resources": {
-                "worker_node": 0.1,
-                f"worker_id_{startup_node}": 0.1,
-            },
-        }
-        logger.info(f"Startup config: {startup_config}, {self.backend_config}")
-
-        await start_instance.options(
-            resources={
-                "worker_node": 0.1,
-                f"worker_id_{startup_node}": 0.1,
-            }
-        ).remote(
-            instance_id,
-            self.backend,
-            self.model_name,
-            self.backend_config,
-            startup_config,
-        )
-        logger.info(
-            f"Started instance {instance_id} for model {self.model_name}"
-        )
-        instance.backend_instance = ray.get_actor(instance_id)
-        async with instance.lock:
-            instance.ready = True
-            instance.node_id = startup_node
-        await instance.backend_instance.init_backend.remote()
-
-        async with self.instance_management_lock:
-            self.ready_inference_instances[instance_id] = instance
-            self.starting_inference_instances.pop(instance_id)
-            if self.device == "gpu":
-                self.instance_to_load_status[instance_id] = (
-                    False if self.gpu_lazy_load else True
-                )
-        return instance_id
-
-    async def _stop_instance(self, instance_id: Optional[str] = None):
-        while len(self.ready_inference_instances) <= 0:
-            await asyncio.sleep(1)
-
-        async with self.instance_management_lock:
-            if instance_id is None:
-                instance_id, instance = self.ready_inference_instances.popitem()
-            elif instance_id in self.ready_inference_instances:
-                instance = self.ready_inference_instances.pop(instance_id)
-            else:
-                logger.error(f"Instance {instance_id} not found")
-                return
-            self.deleting_inference_instances[instance_id] = instance
-        logger.info(
-            f"Stopping instance {instance_id} for model {self.model_name}"
-        )
-        self.loop.create_task(self._finish_instance(instance_id))
-
-    async def _finish_instance(self, instance_id: str):
-        async with self.instance_management_lock:
-            if instance_id not in self.deleting_inference_instances:
-                logger.error(f"Instance {instance_id} not found")
-                return
-            instance = self.deleting_inference_instances.pop(instance_id)
-        async with instance.lock:
-            instance.status = False
-        await instance.backend_instance.stop.remote()
-        ray.kill(instance.backend_instance)
-        await self.model_loading_scheduler.deallocate_resource.remote(
-            self.model_name, instance_id, self.resource_requirements
-        )
-
-    async def _shutdown_instance(self, instance_id: str):
-        logger.info(
-            f"Force deleting an instance (even if it is busy) for model {self.model_name}"
-        )
-        async with self.instance_management_lock:
-            pool = self.ready_inference_instances
-            if instance_id not in pool:
-                logger.error(f"Instance {instance_id} not found")
-                return
-            instance = pool.pop(instance_id)
-            async with instance.lock:
-                instance.status = False
-        await instance.backend_instance.shutdown.remote()
-        ray.kill(instance.backend_instance)
-        await self.model_loading_scheduler.deallocate_resource.remote(
-            self.model_name, instance_id, self.resource_requirements
-        )
-        return

@@ -16,28 +16,22 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 import asyncio
-import datetime
 import os
 import uuid
-from typing import List, Mapping, Optional, Dict
+from typing import Mapping, Optional, Dict
+import time
 
 import ray
 
 from sllm.logger import init_logger
 from sllm.routers import MigrationRouter, RoundRobinRouter
 from sllm.schedulers import FcfsScheduler
-from sllm.sllm.utils import InstanceHandle
-from sllm.store_manager import StoreManager
-
-
-class SllmControllerException(Exception):
-    def __init__(self, message, method):
-        real_message = f"[{method}]: {message}"
-        super().__init__(real_message)
-
+from sllm.utils import TokenizerWrapper
 
 logger = init_logger(__name__)
 
+def generate_lazy_load_method(model_name: str, input_length: int):
+    pass
 
 class SllmController:
     def __init__(self, config: Optional[Mapping] = None):
@@ -51,6 +45,7 @@ class SllmController:
         self.cpu_request_routers = {} # 每个model在CPU的router中只有一个instance
         # Register model info
         self.registered_models = {}
+        self.tokenizers: Dict[str, TokenizerWrapper] = {}
 
     async def start(self):
         async with self.running_lock:
@@ -58,14 +53,6 @@ class SllmController:
                 logger.error("Controller already started")
                 raise RuntimeError("Controller already started")
             self.running = True
-
-        logger.info("Starting store manager")
-        ray_manager_cls = ray.remote(StoreManager)
-        self.store_manager = ray_manager_cls.options(
-            name="store_manager",
-            resources={"control_node": 0.1},
-        ).remote()
-        await self.store_manager.initialize_cluster.remote()
 
         logger.info("Starting scheduler")
         ray_scheduler_cls = ray.remote(FcfsScheduler)
@@ -78,12 +65,10 @@ class SllmController:
         self.cpu_router_cls = ray.remote(RoundRobinRouter) 
 
         self.scheduler = ray_scheduler_cls.options(
-            name="model_loading_scheduler", resources={"control_node": 0.1}
-        ).remote(
-            scheduler_config={
-                "enable_migration": enable_migration,
-            }
-        )
+            name="model_loading_scheduler",
+            resources=self._control_node_resources(),
+            max_concurrency=100,
+        ).remote()
         self.scheduler.start.remote()
 
     async def register(self, model_config):
@@ -96,7 +81,6 @@ class SllmController:
             logger.error(f"Backend not specified for model {model_name}")
             return
         backend_config = model_config.get("backend_config", {})
-        router_config = model_config.get("router_config", {})
         auto_scaling_config = model_config.get("auto_scaling_config", None)
         async with self.metadata_lock:
             if model_name in self.registered_models:
@@ -104,11 +88,9 @@ class SllmController:
                 return
 
         logger.info(f"Registering new model {model_name}")
-        try:
-            await self.store_manager.register.remote(model_config)
-        except RuntimeError as e:
-            error_message = e.args[0]
-            raise RuntimeError(f"{error_message}")
+
+        self.tokenizers[model_name] = TokenizerWrapper(model_name, trust_remote_code=True)
+
         # TODO: put resource requirements in model_config
         cpu_resource_requirements = {
             "num_cpus": 1,
@@ -127,6 +109,7 @@ class SllmController:
             "cpu"
         )
 
+        backend_config["lazy_load"] = True
         gpu_resource_requirements = {
             "num_cpus": 1,
             "num_gpus": model_config.get("num_gpus", 0),
@@ -160,6 +143,196 @@ class SllmController:
             self.cpu_request_routers[model_name] = cpu_request_router
             self.gpu_request_routers[model_name] = gpu_request_router
 
+    async def generate_stream(self, model_name: str, request_data: Dict[str, Any]):
+        logger.info(f"Received request for model {model_name}")
+
+        async with self.metadata_lock:
+            if model_name not in self.cpu_request_routers or model_name not in self.gpu_request_routers:
+                raise ValueError(f"Model {model_name} not found")
+            cpu_router = self.cpu_request_routers[model_name]
+            gpu_router = self.gpu_request_routers[model_name]
+
+        logger.info(f"Got request router for {model_name}")
+
+        input_length = self.tokenizers[model_name].get_prompt_len(request_data["prompt"])
+        request_data["input_length"] = input_length
+
+        # ---- Hot path: GPU weights already loaded ---- #
+        gpu_ready = await gpu_router.has_loaded_instance.remote()
+        if gpu_ready:
+            result_ref = gpu_router.inference.remote(
+                request_data=request_data, action="generate"
+            )
+            return await result_ref
+
+        # ---- Resolve the node hosting this model's GPU instance ---- #
+        node_id = await self.scheduler.get_node_for_model.remote(model_name)
+        if node_id is None:
+            return {"error": "No GPU node allocated for this model"}
+
+        # ---- Check whether a cold start for THIS model is already running ---- #
+        is_cold_starting, cold_start_method = (
+            await self.scheduler.get_cold_start_status.remote(node_id, model_name)
+        )
+
+        if is_cold_starting:
+            # Another request already triggered a cold start – piggyback
+            # instead of starting a second cold start.
+            logger.info(
+                f"Cold start already in progress for {model_name} on node "
+                f"{node_id} (method={cold_start_method}), piggybacking request"
+            )
+            if cold_start_method == "tokenwise":
+                # Tokenwise: GPU is loading / has loaded weights.
+                # Send the request directly to the GPU instance.
+                result = await gpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+                return result
+            else:
+                # Layerwise: GPU may not have all layer weights yet.
+                # Send to both CPU (early-layer prefill) and GPU.
+                cpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+                result = await gpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+                return result
+
+        # ---- No cold start running for this model – wait for any prior
+        #      cold start on the same node (possibly another model) to
+        #      release shared resources before starting a new one. ---- #
+        await self.scheduler.wait_cold_start_ready.remote(node_id)
+
+        # Cold start logic
+        start_time = time.perf_counter()
+
+        # Determine cold-start strategy
+        methods = generate_lazy_load_method(model_name, input_length)
+        cpu_instance = await cpu_router.get_instance.remote()
+        if cpu_instance is None or cpu_instance.backend_instance is None:
+            return {"error": "CPU instance not available"}
+        cpu_backend = cpu_instance.backend_instance
+
+        if methods[0] == "layerwise":
+            # Mark cold start in progress (layerwise) at scheduler (node) level
+            await self.scheduler.start_cold_start.remote(
+                node_id, model_name, "layerwise"
+            )
+            logger.info(f"Starting cold start for model {model_name} (layerwise)")
+
+            try:
+                # 1. Update CPU computing layers
+                await cpu_backend.update_computing_layers.remote(
+                    computing_layers=methods[1]
+                )
+
+                # 2. Start CPU generation (background)
+                cpu_task = cpu_backend.generate.remote(request_data=request_data)
+
+                # 3. Wait for GPU weights
+                layer_idxes = methods[2]
+                await gpu_router.lazy_load_weights.remote(
+                    layer_idxes=layer_idxes,
+                    load_method=methods[0],
+                    request_id=request_data.get("request_id"),
+                )
+
+                # 4. Start GPU generation
+                # NOTE: For layerwise, the first-token callback in vllm_backend
+                # calls router.notify_first_token → scheduler.notify_first_token,
+                # which sets the node's ready event so the next cold start on
+                # the same node may begin.
+                result = await gpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+
+                _, metrics = result
+                logger.info(
+                    f"Cold start finished. E2E: {metrics['e2e']:.4f}s, "
+                    f"TTFT: {metrics.get('ttft', 'N/A')}, "
+                    f"TPOT: {metrics.get('tpot', 'N/A')}"
+                )
+                return result
+            finally:
+                await self.scheduler.finish_cold_start.remote(
+                    node_id, model_name
+                )
+
+        else:
+            # Tokenwise cold start
+            await self.scheduler.start_cold_start.remote(
+                node_id, model_name, "tokenwise"
+            )
+            logger.info(f"Starting cold start for model {model_name} (tokenwise)")
+
+            try:
+                start_time = time.perf_counter()
+                cpu_compute_tokens = methods[1]
+                cpu_request_data = request_data.copy()
+                cpu_request_data.setdefault("extra_args", {})
+                cpu_request_data["extra_args"]["kv_transfer_params"] = {
+                    "do_remote_decode": True,
+                    "do_remote_prefill": False,
+                    "max_num_prefill_compute_tokens": cpu_compute_tokens,
+                }
+                cpu_task = cpu_backend.generate.remote(request_data=cpu_request_data)
+
+                layer_idxes = methods[2]
+                gpu_load_task = gpu_router.lazy_load_weights.remote(
+                    layer_idxes=layer_idxes,
+                    load_method=methods[0],
+                    request_id=request_data.get("request_id"),
+                )
+
+                cpu_result = await cpu_task
+                # CPU computation done → tokenwise readiness criteria met.
+                # Signal at the node level so that the next cold start may begin.
+                await self.scheduler.signal_cold_start_ready.remote(node_id)
+
+                await gpu_load_task
+
+                gpu_request_data = request_data.copy()
+                gpu_request_data.setdefault("extra_args", {})
+                gpu_request_data["prompt"] += cpu_result[0]["choices"][0]["text"]
+                gpu_request_data["extra_args"]["kv_transfer_params"] = {
+                    "do_remote_decode": False,
+                    "do_remote_prefill": True,
+                    "num_computed_tokens": cpu_compute_tokens,
+                }
+                gpu_result = await gpu_router.inference.remote(
+                    request_data=gpu_request_data, action="generate"
+                )
+
+                end_time = time.perf_counter()
+                gpu_result[1]["e2e"] = end_time - start_time
+                gpu_result[1]["tpot"] = (
+                    (gpu_result[1]["e2e"] - gpu_result[1]["ttft"])
+                    / (gpu_result[1]["output_length"] - 1)
+                )
+                if cpu_compute_tokens >= input_length:
+                    gpu_result[1]["ttft"] = cpu_result[1]["ttft"]
+                    gpu_result[1]["output_length"] += cpu_result[1]["output_length"]
+                    gpu_result[1]["itls"] = (
+                        cpu_result[1]["itls"] + gpu_result[1]["itls"]
+                    )
+                else:
+                    gpu_result[1]["ttft"] = (
+                        gpu_result[1]["first_token_time"] - start_time
+                    )
+
+                _, metrics = gpu_result
+                logger.info(
+                    f"Cold start finished. E2E: {metrics['e2e']:.4f}s, "
+                    f"TTFT: {metrics.get('ttft', 'N/A')}, "
+                    f"TPOT: {metrics.get('tpot', 'N/A')}"
+                )
+                return gpu_result
+            finally:
+                await self.scheduler.finish_cold_start.remote(
+                    node_id, model_name
+                )
 
     async def update(self, model_name: str, model_config: Mapping):
         async with self.metadata_lock:

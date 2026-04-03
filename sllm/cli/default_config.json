@@ -5,14 +5,31 @@
     "auto_scaling_config": {
         "metric": "concurrency",
         "target": 1,
-        "min_instances": 0,
+        "min_instances": 1,
         "max_instances": 10,
-        "keep_alive": 0
+        "keep_alive": 60
     },
     "backend_config": {
         "pretrained_model_name_or_path": "",
         "device_map": "auto",
         "torch_dtype": "bfloat16",
-        "hf_model_class": "AutoModelForCausalLM"
+        "hf_model_class": "AutoModelForCausalLM",
+        "lazy_load": true,
+        "prewarm_gpu_instances": 1,
+        "prewarm_gpu_instances_per_gpu": 1,
+        "load_method": "tokenwise",
+        "layerwise_end_layer": -1,
+        "scale_up_threshold": 0.8,
+        "load_method_policy": {
+            "tokenwise_max_prompt_len": 1024,
+            "layerwise_min_prompt_len": 2048,
+            "layerwise_models": [],
+            "tokenwise_models": []
+        },
+
+        "shm_tp_size": 2,
+        "shm_size": 4293918720,
+        "shm_num_blocks": 455,
+        "shm_block_len": 131072
     }
 }

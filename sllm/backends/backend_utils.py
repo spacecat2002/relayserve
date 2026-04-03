@@ -30,7 +30,11 @@ class BackendStatus(Enum):
 class SllmBackend(ABC):
     @abstractmethod
     def __init__(
-        self, model_name: str, backend_config: Optional[Dict[str, Any]] = None
+        self,
+        instance_id: str,
+        model_name: str,
+        device: str,
+        backend_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         pass
 
@@ -43,7 +47,7 @@ class SllmBackend(ABC):
         pass
 
     @abstractmethod
-    async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
+    async def lazy_load_weights(self, end_layer: int = -1, warmup: bool = False):
         pass
 
     @abstractmethod
@@ -72,4 +76,8 @@ class SllmBackend(ABC):
 
     @abstractmethod
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
+        pass
+
+    @abstractmethod
+    async def update_computing_layers(self, computing_layers: int):
         pass

@@ -17,7 +17,7 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import ray
 
@@ -54,7 +54,6 @@ def get_worker_nodes():
 class InstanceStatus:
     instance_id: str
     node_id: str
-    num_gpu: int
     concurrency: int
 
     model_name: Optional[str] = None
@@ -66,12 +65,17 @@ class InstanceStatus:
 class InstanceHandle:
     instance_id: str
     max_queue_length: int
-    num_gpu: int
 
     node_id: Optional[str] = None
     backend_instance: Optional[ray.actor.ActorHandle] = None
     ready: bool = False
     concurrency: int = 0
+    num_gpu: int = 0
+    empty_instance: bool = False
+    load_method: Optional[str] = None
+    gpu_group: Optional[List[int]] = None
+    preferred_gpu_ids: Optional[List[int]] = None
+    gpu_locked: bool = False
 
     lock: asyncio.Lock = asyncio.Lock()
 
@@ -96,6 +100,23 @@ class InstanceHandle:
             return InstanceStatus(
                 self.instance_id,
                 self.node_id,
-                self.num_gpu,
                 self.concurrency,
             )
+
+
+from transformers import AutoTokenizer
+class TokenizerWrapper:
+    def __init__(
+        self,
+        tokenizer_name: str,
+        trust_remote_code: bool = False,
+    ) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+        )
+
+    def get_prompt_len(self, text: str) -> int:
+        if not isinstance(text, str) or text == "":
+            return 0
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
