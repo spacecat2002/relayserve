@@ -32,7 +32,7 @@ from distributed_inference.backends.cgroup_utils import (
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(resources={"gpu_node": 1}, num_gpus=1)
+@ray.remote(resources={"gpu_node": 1}, num_gpus=2)
 class GpuBackend(SllmBackend):
     """
     GPU Backend with lazy loading.
@@ -67,22 +67,19 @@ class GpuBackend(SllmBackend):
             "enable_prefix_caching": False,  # Disable prefix caching
             "lazy_load": True,  # Enable lazy loading
             "dtype": "bfloat16",
-            # "shm_tp_size": 1,
-            # "kv_transfer_config": {
-            #     "kv_connector": "ShmConnector",
-            #     "kv_role": "kv_consumer",
-            #     "kv_rank": 1,
-            #     "shm_size": 4284481536,
-            #     "shm_num_blocks": 227,
-            #     "shm_block_len": 262144,
-            #     "shm_tp_size": 1
-            # }
-            "load_method": "layerwise",
+            #"pipeline_parallel_size": 2,
+            #"tensor_parallel_size": 2,
+            "load_method": "tokenwise",
             "shm_tp_size": 2,
             "shm_kv_cache_size": 4293918720,
             "shm_num_blocks": 455,
             "shm_block_len": 131072,
-            "block_size": 128
+            "block_size": 128,
+            "kv_transfer_config": {
+                "kv_connector": "ShmConnector",
+                "kv_role": "kv_consumer",
+                "kv_rank": 1
+            }
         }
 
         logger.info(f"Creating GPU backend with lazy loading config: {engine_config}")
@@ -103,8 +100,8 @@ class GpuBackend(SllmBackend):
 
             logger.info("Initializing GPU backend and loading weights...")
             start_time = time.time()
-
-            os.sched_setaffinity(0, {126})
+            os.environ["VLLM_SLEEP_WHEN_IDLE"] = "1"
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
             #os.sched_setaffinity(0, {62})
             # 如果 cgroup 不可用，会自动回退到 os.sched_setaffinity
             # cpus = {62}  # 可以从 backend_config 中读取配置
@@ -136,9 +133,9 @@ class GpuBackend(SllmBackend):
             logger.info(f"CPU backend initialized in {load_time:.2f} seconds")
             self.status = BackendStatus.RUNNING
 
-    async def wait_for_weights(self, layer_idxes: list[int]) -> bool:
+    async def wait_for_weights(self, layer_idxes: list[list[int]], request_id: str=None) -> bool:
         start_time = time.time()
-        await self.engine.lazy_init(layer_idxes=layer_idxes, no_warmup=False)
+        await self.engine.lazy_init(layer_idxes_by_pp=layer_idxes, no_warmup=False, request_id=request_id)
         print(f"DEBUG: GPU weights loaded, id(self)={id(self)}, time={time.time() - start_time}")
         self.weights_loaded = True
         return True
@@ -230,12 +227,15 @@ class GpuBackend(SllmBackend):
                 if first_token_time is None:
                     first_token_time = current_time
                     ttft = first_token_time - stream_start_time
-                    print(f"ttft: {ttft}")
+                    # 打印到文件：
+                    with open("gpu_latency.txt", "a") as f:
+                        f.write(f"{ttft}\n")
                 else:
                     token_count += 1
                     # Calculate inter-token latency (ITL)
                     itl = current_time - most_recent_timestamp
-                    print(f"itl: {itl}")
+                    with open("gpu_latency.txt", "a") as f:
+                        f.write(f"{itl}\n")
                     itl_list.append(itl)
                 
                 
@@ -254,7 +254,7 @@ class GpuBackend(SllmBackend):
             print(f"itl_list: {itl_list}")
             return {
                 "done": True,
-                "ttft": first_token_time,
+                "ttft": first_token_time - stream_start_time,
                 "tpot": final_tpot,
             }
         else:
@@ -304,6 +304,9 @@ class GpuBackend(SllmBackend):
         """Get current tokens for migration."""
         return []
 
-    async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
+    async def lazy_load_weights(self, layer_idxes: list[list[int]], request_id: str=None):
+        pass
+
+    async def update_computing_layers(self, computing_layers: int):
         pass
 

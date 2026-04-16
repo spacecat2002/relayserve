@@ -48,9 +48,11 @@ class MigrationCoordinator:
         self.gpu_weights_ready = False
 
     async def start_profile(self):
+        #await self.cpu_backend.start_profile.remote()
         await self.gpu_backend.start_profile.remote()
 
     async def stop_profile(self):
+        #await self.cpu_backend.stop_profile.remote()
         await self.gpu_backend.stop_profile.remote()
 
     async def initialize(self):
@@ -83,12 +85,12 @@ class MigrationCoordinator:
         # Start GPU backend on GPU node (lazy loading)
         gpu_startup_config = {
             "num_cpus": 4,
-            "num_gpus": 1,
+            "num_gpus": 2,
             "resources": {"gpu_node": 1},
         }
 
         await start_backend.options(
-            resources={"gpu_node": 1}, num_gpus=1
+            resources={"gpu_node": 1}, num_gpus=2
         ).remote(
             backend_name=self.gpu_backend_name,
             backend_type="gpu",
@@ -135,28 +137,51 @@ class MigrationCoordinator:
             result = await self.gpu_backend.generate_stream.remote(request_data=gpu_request)
             result["start_time"] = start_time
             return result
+        # else:
+        #     request = request_data.copy()
+        #     request["request_id"] = request_id
+        #     #layer_idxes = [list(range(5, 34))]
+        #     layer_idxes = [[3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2], list(range(16, 36))]
+        #     await self.cpu_backend.update_computing_layers.remote(computing_layers=8)
+        #     await self.cpu_backend.enable_pp_cleanup.remote()
+        #     self.cpu_backend.generate_stream.remote(request_data=request)
+        #     time1 = time.perf_counter()
+        #     await self.gpu_backend.wait_for_weights.remote(layer_idxes=layer_idxes, request_id=request_id)
+        #     time2 = time.perf_counter()
+        #     # 将时间写入文件
+        #     # with open("gpu_latency.txt", "a") as f:
+        #     #     f.write(f"gpu_weights_task: {time2 - time1}\n")
+        #     print(f"DEBUG: gpu_weights_task: {time2 - time1}")
+            
+        #     gpu_task = self.gpu_backend.generate_stream.remote(request_data=request)
+        #     gpu_result = await gpu_task
+
         else:
             computed_tokens = -1
             # CPU does prefill + decode, check GPU periodically
             request = request_data.copy()
             request["request_id"] = request_id  # Ensure same request_id
+            request["extra_args"] = {}
+            request["extra_args"]["kv_transfer_params"] = {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "max_num_prefill_compute_tokens": computed_tokens,
+            }
             
             # Start both CPU generation and GPU weight waiting concurrently
             # Ray's .remote() returns ObjectRef which can be awaited directly
             # NOTE: Use keyword argument for dict parameter (Ray issue #26283)
-            await self.cpu_backend.update_computing_layers.remote(computing_layers=18)
             cpu_task = self.cpu_backend.generate_stream.remote(request_data=request)
-            layer_idxes = list(range(5, 34))
-            gpu_weights_task = self.gpu_backend.wait_for_weights.remote(layer_idxes=layer_idxes)
+            #layer_idxes = [list(range(0, 16)), list(range(16, 36))]
+            layer_idxes = [list(range(0,36))]
+            gpu_weights_task = self.gpu_backend.wait_for_weights.remote(layer_idxes=layer_idxes, request_id=request_id)
+            # Do not run a full GPU generate in parallel with CPU on the same request_id:
+            # both sides may block in KV transfer (CPU waiting for GPU / GPU waiting for CPU).
+            # Wait for CPU to finish the producer phase, then run GPU continuation once below.
+            cpu_result = await cpu_task
             await gpu_weights_task
-            gpu_task = self.gpu_backend.generate_stream.remote(request_data=request)
-            gpu_result = await gpu_task
-            # Wait for CPU generation to complete
-            # if cpu_task is not None:
-            #     cpu_result = await cpu_task
-            #     print(f"DEBUG: CPU result: {cpu_result}")
-            # else:
-            #     cpu_result = None
+
+            print(f"DEBUG: CPU result: {cpu_result}")
             
             # if cpu_result is not None and "error" in cpu_result:
             #     # Cancel GPU weights task if CPU failed (ObjectRef cannot be cancelled, but we can ignore it)
@@ -165,51 +190,44 @@ class MigrationCoordinator:
             
             # Check if GPU weights are ready (may have completed before or after CPU)
             # ObjectRef can be awaited directly
-            # weights_ready = await gpu_weights_task
 
             # print(f"DEBUG: After await gpu_weights_task, weights_ready={weights_ready}, id(self)={id(self)}")
             # # Only set gpu_weights_ready if weights are actually ready
-            # if weights_ready:
-            #     self.gpu_weights_ready = True
-            #     logger.info(f"GPU weights are ready, setting gpu_weights_ready=True (was {self.gpu_weights_ready} before)")
-            #     print(f"DEBUG: Setting gpu_weights_ready=True, self.gpu_weights_ready={self.gpu_weights_ready}")
-            # else:
-            #     logger.warning(f"GPU weights not ready, keeping gpu_weights_ready=False")
-            #     # Return CPU result if GPU weights not ready
-            #     return cpu_result
             
-            # # Case 1: CPU did prefill + some decode, GPU does remaining decode
-            # logger.info(f"Migrating request {request_id} from CPU to GPU")
+            # Case 1: CPU did prefill + some decode, GPU does remaining decode
+            print(f"Migrating request {request_id} from CPU to GPU")
             
-            # # Get accumulated tokens from CPU result
-            # if cpu_result is not None:
-            #     new_prompt = prompt + cpu_result.get("generated_text", "")
-            # else:
-            #     new_prompt = prompt
+            # Get accumulated tokens from CPU result
+            
+            new_prompt = prompt + cpu_result.get("generated_text", "")
             
             # Continue on GPU for remaining decode
-            # gpu_request = request_data.copy()
-            # gpu_request["request_id"] = request_id  # Ensure same request_id
-            # gpu_request["prompt"] = new_prompt
-            # gpu_request["extra_args"] = {}
-            # gpu_request["extra_args"]["kv_transfer_params"] = {
-            #     "do_remote_decode": True,     # Enable remote decode
-            #     "do_remote_prefill": False,   # This is the prefill instance
-            #     "num_computed_tokens": cpu_computed_tokens         # prompt中最多计算的token数，-1代表计算所有token
-            # }
-            # # NOTE: Use keyword argument for dict parameter (Ray issue #26283)
+            gpu_request = request_data.copy()
+            gpu_request["request_id"] = request_id  # Ensure same request_id
+            gpu_request["prompt"] = new_prompt
 
-            # #cpu_task2 = self.cpu_backend.generate_stream.remote(request_data=cpu_request)
-            # gpu_result = await self.gpu_backend.generate_stream.remote(request_data=gpu_request)
+            gpu_request["extra_args"] = {}
+            gpu_request["extra_args"]["kv_transfer_params"] = {
+                "do_remote_decode": False,     # Enable remote decode
+                "do_remote_prefill": True,   # This is the prefill instance
+                "num_computed_tokens": computed_tokens,         # prompt中最多计算的token数，-1代表计算所有token
+                "remote_block_ids": cpu_result.get("kv_transfer_params", {}).get("remote_block_ids", []),
+            }
+            # NOTE: Use keyword argument for dict parameter (Ray issue #26283)
+
+            #cpu_task2 = self.cpu_backend.generate_stream.remote(request_data=cpu_request)
+            gpu_result = await self.gpu_backend.generate_stream.remote(request_data=gpu_request)
+            print(f"DEBUG: GPU result: {gpu_result}")
 
             
-            # # Calculate overall metrics
-            # if cpu_result is not None:
-            #     cpu_ttft = cpu_result.get("ttft", 0.0)
-            #     cpu_tpot = cpu_result.get("tpot", 0.0)
-            # else:
-            #     cpu_ttft = 0.0
-            #     cpu_tpot = 0.0
+            # Calculate overall metrics
+            if cpu_result is not None:
+                cpu_ttft = cpu_result.get("ttft", 0.0)
+                cpu_tpot = cpu_result.get("tpot", 0.0)
+            else:
+                cpu_ttft = 0.0
+                cpu_tpot = 0.0
+
             if gpu_result is not None:
                 gpu_ttft = gpu_result.get("ttft", 0.0)
                 gpu_tpot = gpu_result.get("tpot", 0.0)
@@ -219,9 +237,9 @@ class MigrationCoordinator:
             
             return {
                 "done": True,
-                #"cpu_ttft": cpu_ttft,
+                "cpu_ttft": cpu_ttft,
                 "gpu_ttft": gpu_ttft,
-                #"cpu_tpot": cpu_tpot,
+                "cpu_tpot": cpu_tpot,
                 "gpu_tpot": gpu_tpot,
                 "start_time": start_time,
             }

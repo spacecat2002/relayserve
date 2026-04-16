@@ -27,9 +27,9 @@ from vllm import (
     RequestOutput,
 )
 
-from sllm.backends.vllm_backend import (
+from sllm.backends.backend_utils import (
     BackendStatus,
-    VllmBackend,
+    CPUBackend,
 )
 
 
@@ -105,7 +105,7 @@ async def encode(
 @pytest.fixture
 def async_llm_engine():
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine"
+        "sllm.backends.cpu_backend.AsyncLLMEngine"
     ) as MockAsyncLLMEngine:
         async_llm_engine_obj = MockAsyncLLMEngine.return_value
         async_llm_engine_obj.from_engine_args.return_value = (
@@ -119,7 +119,7 @@ def async_llm_engine():
 
 @pytest.fixture
 def vllm_backend(model_name, backend_config, async_llm_engine):
-    yield VllmBackend(model_name, "cpu", backend_config)
+    yield CPUBackend("test-instance", model_name, "cpu", backend_config)
 
 
 def test_init(vllm_backend, backend_config):
@@ -130,7 +130,7 @@ def test_init(vllm_backend, backend_config):
 @pytest.mark.asyncio
 async def test_init_backend(vllm_backend, async_llm_engine):
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
@@ -145,7 +145,7 @@ async def test_generate_without_init(vllm_backend):
         "request_id": "test-request-id",
     }
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=AsyncMock(),
     ):
         response = await vllm_backend.generate(request_data)
@@ -160,7 +160,7 @@ async def test_generate(vllm_backend, async_llm_engine):
         "request_id": "test-request-id",
     }
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
@@ -174,14 +174,14 @@ async def test_generate(vllm_backend, async_llm_engine):
 async def test_shutdown(model_name, backend_config, async_llm_engine):
     # Open trace debug to avoid clean the finished request in record map
     backend_config["trace_debug"] = True
-    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
+    vllm_backend = CPUBackend("test-instance", model_name, "cpu", backend_config)
     request_data = {
         "model": "test-model",
         "prompt": "user: Hello",
         "request_id": "test-request-id",
     }
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
@@ -200,13 +200,13 @@ async def test_stop(vllm_backend, async_llm_engine):
         "request_id": "test-request-id",
     }
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
     await vllm_backend.generate(request_data)
     with patch(
-        "sllm.backends.vllm_backend.VllmBackend.shutdown",
+        "sllm.backends.cpu_backend.CPUBackend.shutdown",
         new_callable=AsyncMock,
     ) as mock_shutdown:
         await vllm_backend.stop()
@@ -221,7 +221,7 @@ async def test_stop(vllm_backend, async_llm_engine):
 async def test_get_current_tokens(model_name, backend_config, async_llm_engine):
     # Open trace debug to avoid clean the finished request in record map
     backend_config["trace_debug"] = True
-    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
+    vllm_backend = CPUBackend("test-instance", model_name, "cpu", backend_config)
     request_data = [
         {
             "model": "test-model",
@@ -231,7 +231,7 @@ async def test_get_current_tokens(model_name, backend_config, async_llm_engine):
         for i in range(3)
     ]
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
@@ -242,9 +242,9 @@ async def test_get_current_tokens(model_name, backend_config, async_llm_engine):
 
 
 @pytest.mark.asyncio
-async def test_resume_kv_cache(vllm_backend):
+async def test_resume_kv_cache(vllm_backend, async_llm_engine):
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()
@@ -258,12 +258,12 @@ async def test_resume_kv_cache(vllm_backend):
 async def test_encode(backend_config, async_llm_engine, model_name):
     backend_config["enforce_eager"] = True
     backend_config["enable_prefix_caching"] = False
-    vllm_backend = VllmBackend(model_name, "cpu", backend_config)
+    vllm_backend = CPUBackend("test-instance", model_name, "cpu", backend_config)
 
     request_data = {"model": "test-model", "input": ["Hi, How are you?"]}
 
     with patch(
-        "sllm.backends.vllm_backend.AsyncLLMEngine.from_engine_args",
+        "sllm.backends.cpu_backend.AsyncLLMEngine.from_engine_args",
         return_value=async_llm_engine,
     ):
         await vllm_backend.init_backend()

@@ -16,8 +16,11 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 from .fcfs_scheduler import FcfsScheduler
-from .numa_utils import detect_gpu_numa_affinity, load_gpu_numa_affinity
-from .scheduler_utils import SllmScheduler
+from .scheduler_utils import (
+    SllmScheduler,
+    detect_gpu_numa_affinity,
+    load_gpu_numa_affinity,
+)
 
 __all__ = [
     "FcfsScheduler",

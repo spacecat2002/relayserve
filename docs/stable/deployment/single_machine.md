@@ -127,7 +127,7 @@ Open another new terminal and run:
 conda activate sllm-worker
 export CUDA_VISIBLE_DEVICES=0 # Or your desired GPU ID
 ray start --address=0.0.0.0:6379 --num-cpus=4 --num-gpus=1 \
-  --resources='{"worker_node": 1, "worker_id_0": 1}' --block
+  --resources='{"worker_node": 1, "gpu_worker_0": 1}' --block
 ```
 
 ### 2. Start the ServerlessLLM Store Server

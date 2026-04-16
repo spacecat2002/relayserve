@@ -13,8 +13,8 @@ set -e
 ray start \
     --address="localhost:10000" \
     --num-cpus=4 \
-    --num-gpus=1 \
-    --resources='{"gpu_node": 1}' \
+    --num-gpus=2 \
+    --resources='{"worker_node": 1, "gpu_worker_0": 1}' \
     --disable-usage-stats
 
 echo ""

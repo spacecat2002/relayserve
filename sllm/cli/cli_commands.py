@@ -17,7 +17,7 @@
 # ---------------------------------------------------------------------------- #
 import click
 
-from sllm.cli._cli_utils import (
+from sllm.cli.cli_utils import (
     delete_model,
     deploy_model,
     show_status,

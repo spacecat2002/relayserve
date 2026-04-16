@@ -95,7 +95,7 @@ class VllmModelDownloader:
             # save the models in the ServerlessLLM format
             if not os.path.exists(model_path):
                 model_executer.save_shm_model(
-                    path=model_path, pattern=pattern, max_size=max_size
+                    path=model_path
                 )
             for file in os.listdir(input_dir):
                 # Copy the metadata files into the output directory
@@ -127,3 +127,14 @@ class VllmModelDownloader:
             )
         finally:
             cache_dir.cleanup()
+
+if "__main__" == __name__:
+    model_downloader = VllmModelDownloader()
+    model_downloader.download_vllm_model(
+        model_name="/home/zwh/.cache/sllm/Qwen3-8B",
+        pretrained_model_name_or_path="/home/zwh/.cache/huggingface/Qwen3-8B",
+        torch_dtype="bfloat16",
+        tensor_parallel_size=1,
+        pattern=None,
+        max_size=None,
+    )

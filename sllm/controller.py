@@ -18,7 +18,7 @@
 import asyncio
 import os
 import uuid
-from typing import Mapping, Optional, Dict
+from typing import Any, Dict, List, Mapping, Optional
 import time
 
 import ray
@@ -30,12 +30,10 @@ from sllm.utils import TokenizerWrapper
 
 logger = init_logger(__name__)
 
-def generate_lazy_load_method(model_name: str, input_length: int):
-    pass
 
 class SllmController:
     def __init__(self, config: Optional[Mapping] = None):
-        self.config = config
+        self.config = dict(config or {})
 
         self.running_lock = asyncio.Lock()
         self.running = False
@@ -46,6 +44,47 @@ class SllmController:
         # Register model info
         self.registered_models = {}
         self.tokenizers: Dict[str, TokenizerWrapper] = {}
+
+    def _control_node_resources(self) -> Dict[str, float]:
+        control_node_fraction = float(
+            self.config.get("control_node_fraction", 0.1)
+        )
+        return {"control_node": control_node_fraction}
+
+    def _generate_lazy_load_method(
+        self, model_name: str, input_length: int
+    ) -> List[Any]:
+        model_config = self.registered_models.get(model_name, {})
+        backend_config = dict(model_config.get("backend_config", {}))
+        policy = dict(backend_config.get("load_method_policy", {}))
+        default_method = backend_config.get("load_method", "tokenwise")
+
+        tokenwise_models = set(policy.get("tokenwise_models", []))
+        layerwise_models = set(policy.get("layerwise_models", []))
+        tokenwise_max_prompt_len = int(policy.get("tokenwise_max_prompt_len", 1024))
+        layerwise_min_prompt_len = int(policy.get("layerwise_min_prompt_len", 2048))
+
+        if model_name in tokenwise_models or input_length <= tokenwise_max_prompt_len:
+            method = "tokenwise"
+        elif model_name in layerwise_models or input_length >= layerwise_min_prompt_len:
+            method = "layerwise"
+        else:
+            method = default_method
+
+        layer_idxes = list(backend_config.get("layer_idxes", []))
+        if not layer_idxes:
+            end_layer = int(backend_config.get("layerwise_end_layer", -1))
+            if end_layer >= 0:
+                layer_idxes = list(range(end_layer + 1))
+
+        if method == "layerwise":
+            computing_layers = len(layer_idxes)
+            return [method, computing_layers, layer_idxes]
+
+        cpu_compute_tokens = input_length
+        if tokenwise_max_prompt_len > 0:
+            cpu_compute_tokens = min(input_length, tokenwise_max_prompt_len)
+        return [method, cpu_compute_tokens, layer_idxes]
 
     async def start(self):
         async with self.running_lock:
@@ -68,7 +107,7 @@ class SllmController:
             name="model_loading_scheduler",
             resources=self._control_node_resources(),
             max_concurrency=100,
-        ).remote()
+        ).remote(self.config.get("scheduler_config", {}))
         self.scheduler.start.remote()
 
     async def register(self, model_config):
@@ -154,16 +193,39 @@ class SllmController:
 
         logger.info(f"Got request router for {model_name}")
 
+        model_cfg = self.registered_models.get(model_name, {})
+        pp_size = int(
+            model_cfg.get(
+                "pipeline_parallel_size",
+                model_cfg.get("backend_config", {}).get("pipeline_parallel_size", 1),
+            )
+            or 1
+        )
+        is_pp_model = pp_size > 1
+
         input_length = self.tokenizers[model_name].get_prompt_len(request_data["prompt"])
         request_data["input_length"] = input_length
 
-        # ---- Hot path: GPU weights already loaded ---- #
-        gpu_ready = await gpu_router.has_loaded_instance.remote()
-        if gpu_ready:
-            result_ref = gpu_router.inference.remote(
-                request_data=request_data, action="generate"
-            )
-            return await result_ref
+        # ---- Hot path: route to loaded GPU instance when capacity is available ---- #
+        force_amx_assisted_cold_start = False
+        pool_status = await gpu_router.get_instance_pool_status.remote()
+        loaded_ready = int(pool_status.get("loaded_ready", 0))
+        loaded_available = int(pool_status.get("loaded_available", 0))
+        empty_ready = int(pool_status.get("empty_ready", 0))
+        if loaded_ready > 0:
+            if loaded_available > 0:
+                result_ref = gpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+                return await result_ref
+            if empty_ready > 0:
+                force_amx_assisted_cold_start = True
+            else:
+                cpu_result = await cpu_router.inference.remote(
+                    request_data=request_data, action="generate"
+                )
+                await gpu_router.ensure_empty_instance.remote()
+                return cpu_result
 
         # ---- Resolve the node hosting this model's GPU instance ---- #
         node_id = await self.scheduler.get_node_for_model.remote(model_name)
@@ -182,16 +244,14 @@ class SllmController:
                 f"Cold start already in progress for {model_name} on node "
                 f"{node_id} (method={cold_start_method}), piggybacking request"
             )
-            if cold_start_method == "tokenwise":
-                # Tokenwise: GPU is loading / has loaded weights.
-                # Send the request directly to the GPU instance.
+            if cold_start_method == "tokenwise" or (
+                cold_start_method == "layerwise" and is_pp_model
+            ):
                 result = await gpu_router.inference.remote(
                     request_data=request_data, action="generate"
                 )
                 return result
             else:
-                # Layerwise: GPU may not have all layer weights yet.
-                # Send to both CPU (early-layer prefill) and GPU.
                 cpu_router.inference.remote(
                     request_data=request_data, action="generate"
                 )
@@ -209,7 +269,17 @@ class SllmController:
         start_time = time.perf_counter()
 
         # Determine cold-start strategy
-        methods = generate_lazy_load_method(model_name, input_length)
+        methods = self._generate_lazy_load_method(model_name, input_length)
+        if force_amx_assisted_cold_start:
+            tokenwise_max_prompt_len = int(
+                model_cfg.get("backend_config", {})
+                .get("load_method_policy", {})
+                .get("tokenwise_max_prompt_len", 1024)
+            )
+            cpu_compute_tokens = input_length
+            if tokenwise_max_prompt_len > 0:
+                cpu_compute_tokens = min(input_length, tokenwise_max_prompt_len)
+            methods = ["tokenwise", cpu_compute_tokens, methods[2]]
         cpu_instance = await cpu_router.get_instance.remote()
         if cpu_instance is None or cpu_instance.backend_instance is None:
             return {"error": "CPU instance not available"}
@@ -376,7 +446,8 @@ class SllmController:
                 gpu_router = self.gpu_request_routers.pop(model_name)
                 await gpu_router.shutdown.remote()
                 del gpu_router
-            self.registered_models.pop(model_name)
+            self.registered_models.pop(model_name, None)
+            self.tokenizers.pop(model_name, None)
         logger.info(f"Model {model_name} deleted")
 
     async def get_models(self):
@@ -478,10 +549,6 @@ class SllmController:
                 raise RuntimeError("Controller not running")
             self.running = False
 
-        # delete all models
         async with self.metadata_lock:
-            delete_tasks = [
-                self.delete(model_name)
-                for model_name in self.cpu_request_routers.keys()
-            ]
-            await asyncio.gather(*delete_tasks)
+            model_names = list(self.cpu_request_routers.keys())
+        await asyncio.gather(*[self.delete(m) for m in model_names])

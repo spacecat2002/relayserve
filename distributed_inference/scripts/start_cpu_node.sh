@@ -14,7 +14,7 @@ ray start \
     --address="localhost:10000" \
     --num-cpus=64 \
     --num-gpus=0 \
-    --resources='{"cpu_node": 1}' \
+    --resources='{"worker_node": 1, "cpu_worker_0": 1}' \
 
 echo ""
 echo "=========================================="

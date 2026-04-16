@@ -16,7 +16,9 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Optional
+
+import ray
 
 from sllm.logger import init_logger
 
@@ -24,19 +26,10 @@ logger = init_logger(__name__)
 
 
 class SllmRouter(ABC):
-    @abstractmethod
-    def __init__(
-        self,
-        model_name: str,
-        resource_requirements: Dict[str, int],
-        backend: str,
-        backend_config: Dict,
-        device: str,
-    ) -> None:
-        pass
+    """Abstract router for a model (CPU cold-start or GPU pool)."""
 
     @abstractmethod
-    async def start(self, auto_scaling_config: Dict[str, int]):
+    async def start(self, auto_scaling_config: Optional[Dict[str, int]] = None):
         pass
 
     @abstractmethod
@@ -44,9 +37,35 @@ class SllmRouter(ABC):
         pass
 
     @abstractmethod
-    async def update(self, auto_scaling_config: Dict[str, int]):
-        pass
-
-    @abstractmethod
     async def inference(self, request_data: dict, action: str):
         pass
+
+@ray.remote
+def start_instance(
+    instance_id, backend, model_name, backend_config, startup_config, device
+):
+    logger.info(f"Starting instance {instance_id} with backend {backend}")
+    if backend == "vllm":
+        if device == "cpu":
+            from sllm.backends.cpu_backend import CPUBackend
+
+            model_backend_cls = CPUBackend
+        elif device == "gpu":
+            from sllm.backends.gpu_backend import GPUBackend
+
+            model_backend_cls = GPUBackend
+        else:
+            raise ValueError(f"Unknown device for vllm: {device}")
+    else:
+        logger.error(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown backend: {backend}")
+
+    model_actor_cls = ray.remote(model_backend_cls)
+
+    runtime_env = startup_config.get("runtime_env")
+    return model_actor_cls.options(
+        name=instance_id,
+        **startup_config,
+        max_concurrency=10,
+        lifetime="detached",
+    ).remote(instance_id, model_name, device, backend_config, runtime_env)

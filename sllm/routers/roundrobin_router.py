@@ -119,6 +119,7 @@ class RoundRobinRouter(SllmRouter):
         self.idle_time_lock = asyncio.Lock()
 
         self.auto_scaler = None
+        self.load_balancer = None
         self.round_robin_index = 0
         self.request_arrivals = deque()
 
@@ -493,6 +494,56 @@ class RoundRobinRouter(SllmRouter):
                     return True
         return False
 
+    async def get_instance_pool_status(self) -> Dict[str, int]:
+        """Return routing state for controller-side load decisions (GPU router)."""
+        if self.device != "gpu":
+            return {
+                "loaded_ready": 0,
+                "loaded_available": 0,
+                "empty_ready": 0,
+                "empty_starting": 0,
+            }
+        async with self.instance_management_lock:
+            ready_instances = list(self.ready_inference_instances.values())
+            starting_instances = list(self.starting_inference_instances.values())
+            loaded_instances = [
+                inst
+                for inst in ready_instances
+                if self.instance_to_load_status.get(inst.instance_id, False)
+            ]
+            empty_ready = [
+                inst
+                for inst in ready_instances
+                if inst.empty_instance
+                and not self.instance_to_load_status.get(inst.instance_id, False)
+            ]
+            empty_starting = [inst for inst in starting_instances if inst.empty_instance]
+
+        loaded_available = 0
+        for inst in loaded_instances:
+            try:
+                if await inst.check_request_queue():
+                    loaded_available += 1
+            except Exception:
+                continue
+
+        return {
+            "loaded_ready": len(loaded_instances),
+            "loaded_available": loaded_available,
+            "empty_ready": len(empty_ready),
+            "empty_starting": len(empty_starting),
+        }
+
+    async def ensure_empty_instance(self) -> bool:
+        """Ensure at least one empty GPU instance exists or is starting. Returns True if created."""
+        if self.device != "gpu":
+            return False
+        status = await self.get_instance_pool_status()
+        if status["empty_ready"] > 0 or status["empty_starting"] > 0:
+            return False
+        await self._create_instance(empty_instance=True)
+        return True
+
     async def get_instance(self):
         async with self.instance_management_lock:
             for instance_id in self.ready_inference_instances.keys():
@@ -546,24 +597,88 @@ class RoundRobinRouter(SllmRouter):
             self.request_count -= 1
         return result
 
+    async def _teardown_instance_for_shutdown(
+        self, instance_id: str, instance: InstanceHandle
+    ) -> None:
+        """Best-effort teardown for any instance handle (ready / starting / deleting)."""
+        async with instance.lock:
+            instance.status = False
+        if self.device == "gpu" and instance.gpu_locked and instance.gpu_group and instance.node_id:
+            try:
+                await self.model_loading_scheduler.release_gpu_lock.remote(
+                    instance.node_id, instance.gpu_group
+                )
+            except Exception:
+                pass
+            instance.gpu_locked = False
+        be = instance.backend_instance
+        if be is not None:
+            try:
+                await be.shutdown.remote()
+            except Exception:
+                pass
+            try:
+                ray.kill(be)
+            except Exception:
+                pass
+        else:
+            try:
+                ray.kill(ray.get_actor(instance_id))
+            except Exception:
+                pass
+        if self.device == "gpu":
+            try:
+                await self.model_loading_scheduler.deallocate_resource.remote(
+                    self.model_name,
+                    instance_id,
+                    self._build_deallocate_resources(instance),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "deallocate_resource on shutdown failed for %s: %s",
+                    instance_id,
+                    exc,
+                )
+
     async def shutdown(self):
         async with self.running_lock:
             self.running = False
-        # stop all inference instances
-        # return all unfinished requests
+
+        for task in (self.auto_scaler, self.load_balancer):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         while not self.request_queue.empty():
-            instance_allocation = await self.request_queue.get()
-            instance_allocation.set_result(None)
+            try:
+                fut = self.request_queue.get_nowait()
+                fut.set_result(None)
+            except Exception:
+                break
 
         async with self.instance_management_lock:
-            deleted_instance_id = list(self.ready_inference_instances.keys())
-        delete_tasks = [
-            self._shutdown_instance(instance_id)
-            for instance_id in deleted_instance_id
-        ]
-        await asyncio.gather(*delete_tasks)
+            all_items: List[Tuple[str, InstanceHandle]] = []
+            for pool in (
+                self.ready_inference_instances,
+                self.starting_inference_instances,
+                self.deleting_inference_instances,
+            ):
+                all_items.extend(list(pool.items()))
+                pool.clear()
+            self.instance_to_load_status.clear()
+            self.req_to_instance_id.clear()
 
-        return deleted_instance_id
+        await asyncio.gather(
+            *[
+                self._teardown_instance_for_shutdown(iid, inst)
+                for iid, inst in all_items
+            ],
+            return_exceptions=True,
+        )
+        return [iid for iid, _ in all_items]
 
     async def _load_balancer_loop(self):
         while True:
@@ -628,10 +743,13 @@ class RoundRobinRouter(SllmRouter):
                 num_running_instances = len(
                     self.starting_inference_instances
                 ) + len(self.ready_inference_instances)
-            logger.info(
-                f"{self.model_name}: {num_running_instances} instances,"
-                f"need {desired_instances} instances",
-            )
+            if desired_instances != num_running_instances:
+                logger.info(
+                    "%s: %s instances, need %s instances",
+                    self.model_name,
+                    num_running_instances,
+                    desired_instances,
+                )
             if desired_instances > num_running_instances:
                 logger.info("Creating new instance")
                 await self._try_rebalance_for_tp()

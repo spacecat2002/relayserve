@@ -145,7 +145,7 @@ In the second window, start the worker node:
 source /opt/conda/bin/activate
 conda activate sllm-worker
 export CUDA_VISIBLE_DEVICES=0
-ray start --address=0.0.0.0:<PORT> --num-cpus=4 --num-gpus=1 --resources='{"worker_node": 1, "worker_id_0": 1}' --block
+ray start --address=0.0.0.0:<PORT> --num-cpus=4 --num-gpus=1 --resources='{"worker_node": 1, "gpu_worker_0": 1}' --block
 ```
 In the third window, start ServerlessLLM Store server:
 ```shell
@@ -297,7 +297,7 @@ We will start the worker node and store in the same script. Because the server l
    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
    ray start --address=$HEAD_NODE_IP:6379 --num-cpus=4 --num-gpus=1 \
-   --resources='{"worker_node": 1, "worker_id_0": 1}' --block &
+   --resources='{"worker_node": 1, "gpu_worker_0": 1}' --block &
 
    sllm-store start &
 

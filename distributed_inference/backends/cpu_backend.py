@@ -57,7 +57,12 @@ class CpuBackend(SllmBackend):
             "dtype": "bfloat16",
             "tensor_parallel_size": 2,
             "max_model_len": 4096,
-            "load_method": "layerwise",
+            "load_method": "tokenwise",
+            "kv_transfer_config": {
+                "kv_connector": "ShmConnector",
+                "kv_role": "kv_producer",
+                "kv_rank": 0
+            }
         }
         logger.info(f"Creating CPU backend with config: {self.engine_config}")
         self.engine_args = AsyncEngineArgs(**self.engine_config)
@@ -79,7 +84,8 @@ class CpuBackend(SllmBackend):
             start_time = time.time()
 
             # os.sched_setaffinity(0, {0, 32})
-            os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "64-92|96-124"
+            os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "66-94|98-126"
+            os.environ["VLLM_SLEEP_WHEN_IDLE"] = "1"
             #os.environ["VLLM_CPU_OMP_THREADS_BIND"] = "0-28|32-60" 
 
             # Create engine and load weights
@@ -103,6 +109,9 @@ class CpuBackend(SllmBackend):
         if self.engine_config["load_method"] != "layerwise":
             return
         await self.engine.update_computing_layers(computing_layers)
+
+    async def enable_pp_cleanup(self):
+        await self.engine.enable_pp_cleanup()
 
     async def generate_stream(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -187,6 +196,8 @@ class CpuBackend(SllmBackend):
                 prompt_token_ids = current_prompt_token_ids
                 
                 most_recent_timestamp = current_time
+            if response_output.kv_transfer_params is not None:
+                kv_transfer_params = response_output.kv_transfer_params
 
         # Calculate final metrics
         if first_token_time is not None:
@@ -206,6 +217,7 @@ class CpuBackend(SllmBackend):
                 "prompt_token_ids": prompt_token_ids,
                 "output_tokens": output_token_count,
                 "computed_tokens": output_token_count + len(prompt_token_ids),
+                "kv_transfer_params": kv_transfer_params,
             }
         else:
             return {"done": True, "error": "No tokens generated"}
@@ -249,5 +261,5 @@ class CpuBackend(SllmBackend):
 
         await self.shutdown()
 
-    async def lazy_load_weigths(self, end_layer: int = -1, warmup: bool = False):
+    async def lazy_load_weights(self, layer_idxes: list[list[int]], request_id: str=None):
         pass

@@ -170,7 +170,7 @@ Usage:
  0.30000000000000004/1.0 control_node
  0B/526.36GiB memory
  0B/18.63GiB object_store_memory
- 0.0/1.0 worker_id_0
+ 0.0/1.0 gpu_worker_0
  0.0/1.0 worker_node
 
 Demands:

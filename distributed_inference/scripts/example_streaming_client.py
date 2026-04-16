@@ -54,7 +54,7 @@ async def main():
 
 
     prompt_len = 2048
-    tokenizer = AutoTokenizer.from_pretrained("/home/zwh/.cache/huggingface/Qwen3-8B")
+    tokenizer = AutoTokenizer.from_pretrained("/home/zwh/.cache/sllm/Qwen3-8B")
     prompt = build_prompt(prompt_len, tokenizer)
 
     print("\nStreaming output:")
@@ -62,13 +62,13 @@ async def main():
 
     request_id = f"req-{uuid.uuid4()}"
 
-    profile = True
+    profile = False
     if profile:
         await client.start_profile()
 
     result = await client.generate(
         prompt=prompt,
-        max_tokens=5,
+        max_tokens=10,
         temperature=0.0,
         stream=True,
         request_id=request_id
@@ -79,7 +79,7 @@ async def main():
         text = data.get("text", "")
         cpu_ttft = data.get("cpu_ttft", 0.0)
         cpu_tpot = data.get("cpu_tpot", 0.0)    
-        gpu_ttft = data.get("gpu_ttft", 0.0) - data.get("start_time", 0.0)
+        gpu_ttft = data.get("gpu_ttft", 0.0)
         gpu_tpot = data.get("gpu_tpot", 0.0)    
         backend = data.get("backend", "unknown")
         done = data.get("done", False)

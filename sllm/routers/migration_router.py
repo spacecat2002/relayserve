@@ -16,24 +16,18 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 """
-MigrationRouter — extends :class:`RoundRobinRouter` with NUMA-aware
-instance migration so that empty (pre-warmed) instances can be relocated
-to free up GPUs on other NUMA nodes, enabling cross-NUMA tensor-parallel
-dispatch.
+MigrationRouter — NUMA-aware migration for **active** (capacity-committed) instances.
 
-Migration strategy
-------------------
-When the scheduler detects that all free GPUs on a worker are concentrated
-on a single NUMA node, it suggests migrating an *empty* instance away from
-a non-dominant NUMA node **to** the dominant NUMA (which has spare GPUs).
-This frees a GPU slot on the other NUMA, making the overall free-GPU
-distribution span multiple NUMA nodes — a prerequisite for balanced TP
-placement.
+Pure prewarm empties are excluded from NUMA rebalance plans: they do not relieve
+uneven **active** load across NUMA that blocks tensor-parallel placement.
+
+The scheduler prefers migrating loaded / cold-started instances onto the NUMA
+domain where exclusive free GPUs are concentrated so a new TP group can span
+multiple NUMAs. New placements use NUMA-fair GPU ordering in :class:`FcfsScheduler`
+to reduce how often migration is needed.
 """
 import asyncio
 from typing import Dict, List, Optional
-
-import ray
 
 from sllm.logger import init_logger
 
@@ -43,25 +37,23 @@ logger = init_logger(__name__)
 
 
 class MigrationRouter(RoundRobinRouter):
-    """Router with NUMA-aware instance migration support.
-
-    Overrides the no-op migration hooks in :class:`RoundRobinRouter` with
-    real logic that queries the scheduler for a migration plan and executes
-    it by tearing down the old actor and recreating it on the target GPUs.
-    """
+    """Router with NUMA-aware migration for non-prewarm instances."""
 
     # ------------------------------------------------------------------
     # Override: rebalance hook
     # ------------------------------------------------------------------
 
     async def _try_rebalance_for_tp(self) -> None:
-        """Ask the scheduler whether an empty instance should be migrated
-        so that free GPUs span more NUMA nodes, then execute the migration.
-        """
-        if self.device != "gpu":
+        """Run scheduler NUMA migration plan (active instances only), if any."""
+        pp_size = int(self.resource_requirements.get("pp_size", 1))
+        if pp_size > 1:
             return
 
-        tp_size = int(self.resource_requirements.get("num_gpus", 1))
+        tp_size = int(
+            self.resource_requirements.get(
+                "tp_size", self.resource_requirements.get("num_gpus", 1)
+            )
+        )
         if tp_size <= 1:
             return
 
@@ -72,16 +64,13 @@ class MigrationRouter(RoundRobinRouter):
         if not isinstance(plan, dict) or not plan:
             return
 
-        instance_id: Optional[str] = plan.get("instance_id")
-        target_gpu_ids: List[int] = plan.get("target_gpu_ids", [])
-        if not instance_id or not target_gpu_ids:
-            return
-
-        success = await self._migrate_empty_instance(instance_id, target_gpu_ids)
+        success = await self._migrate_instance_for_numa(plan)
         if success:
             logger.info(
-                f"Rebalanced instance {instance_id} to GPUs {target_gpu_ids} "
-                f"for TP={tp_size} NUMA balance"
+                "NUMA rebalance migrated instance %s → GPUs %s (TP=%s)",
+                plan.get("instance_id"),
+                plan.get("target_gpu_ids"),
+                tp_size,
             )
 
     # ------------------------------------------------------------------
@@ -91,77 +80,79 @@ class MigrationRouter(RoundRobinRouter):
     async def _migrate_empty_instance(
         self, instance_id: str, target_gpu_ids: List[int]
     ) -> bool:
-        """Migrate an empty (pre-warmed, no weights loaded) instance to
-        *target_gpu_ids* by destroying the old actor and creating a new one.
+        """Backward-compatible wrapper; prefer :meth:`_migrate_instance_for_numa`."""
+        return await self._migrate_instance_for_numa(
+            {
+                "instance_id": instance_id,
+                "target_gpu_ids": target_gpu_ids,
+                "node_id": None,
+                "target_node_id": None,
+            }
+        )
 
-        Returns ``True`` on success.
+    async def _migrate_instance_for_numa(self, plan: Dict) -> bool:
+        """Tear down *instance_id* and recreate on *target_gpu_ids* (optional cross-node).
+
+        Requires zero in-flight requests. Works for loaded instances (full weight reload).
         """
-        # ---- 1. Validate & remove from ready pool -----------------------
+        instance_id: Optional[str] = plan.get("instance_id")
+        target_gpu_ids: List[int] = list(plan.get("target_gpu_ids", []))
+        source_node: Optional[str] = (
+            str(plan["node_id"]) if plan.get("node_id") is not None else None
+        )
+        target_node: Optional[str] = plan.get("target_node_id")
+        if target_node is not None:
+            target_node = str(target_node)
+        if source_node and target_node is None:
+            target_node = source_node
+        if not instance_id or not target_gpu_ids:
+            return False
+
         async with self.instance_management_lock:
             instance = self.ready_inference_instances.get(instance_id)
             if instance is None:
-                logger.warning(f"Migration skipped: instance {instance_id} not found")
-                return False
-            if not instance.empty_instance:
-                logger.warning(f"Migration skipped: instance {instance_id} is not empty")
-                return False
-            if self.instance_to_load_status.get(instance_id, False):
                 logger.warning(
-                    f"Migration skipped: instance {instance_id} already loaded weights"
+                    "NUMA migration skipped: instance %s not in ready pool",
+                    instance_id,
                 )
                 return False
             if instance.concurrency > 0:
                 logger.warning(
-                    f"Migration skipped: instance {instance_id} has active requests"
+                    "NUMA migration skipped: instance %s has active requests",
+                    instance_id,
                 )
                 return False
-            # Remove from bookkeeping
             self.ready_inference_instances.pop(instance_id, None)
             self.instance_to_load_status.pop(instance_id, None)
 
-        # ---- 2. Release old GPU lock (if any) ---------------------------
-        if (
-            self.device == "gpu"
-            and instance.gpu_locked
-            and instance.gpu_group
-            and instance.node_id
-        ):
-            try:
-                await self.model_loading_scheduler.release_gpu_lock.remote(
-                    instance.node_id, instance.gpu_group
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to release GPU lock for migrated instance "
-                    f"{instance_id}: {e}"
-                )
-            instance.gpu_locked = False
-
-        # ---- 3. Tear down old actor -------------------------------------
+        kv_resume: List[List[int]] = []
         try:
-            await instance.backend_instance.stop.remote()
-            ray.kill(instance.backend_instance)
-        except Exception as e:
-            logger.error(f"Error tearing down instance {instance_id}: {e}")
+            if instance.backend_instance is not None:
+                kv_resume = await instance.backend_instance.get_current_tokens.remote()
+        except Exception as exc:
+            logger.warning(
+                "Could not snapshot token state for KV resume after migration: %s",
+                exc,
+            )
 
-        # ---- 4. Deallocate old resources --------------------------------
-        if self.device == "gpu":
-            try:
-                await self.model_loading_scheduler.deallocate_resource.remote(
-                    self.model_name,
-                    instance_id,
-                    self._build_deallocate_resources(instance),
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to deallocate resources for instance {instance_id}: {e}"
-                )
+        await self._destroy_backend(instance, instance_id)
 
-        # ---- 5. Create new instance on target GPUs ----------------------
+        cross = (
+            source_node is not None
+            and target_node is not None
+            and target_node != source_node
+        )
         await self._create_instance(
-            empty_instance=True, preferred_gpu_ids=target_gpu_ids
+            empty_instance=False,
+            preferred_gpu_ids=target_gpu_ids,
+            preferred_pp0_node_id=target_node if cross else None,
+            kv_resume_after_init=kv_resume or None,
+            force_eager_weight_load=True,
         )
         logger.info(
-            f"Migrated empty instance {instance_id} → preferred GPUs {target_gpu_ids}"
+            "Migrated instance %s → GPUs %s (node=%s)",
+            instance_id,
+            target_gpu_ids,
+            target_node,
         )
         return True

@@ -15,8 +15,14 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
+from .cpu_router import CpuModelRouter
 from .migration_router import MigrationRouter
 from .roundrobin_router import RoundRobinRouter
 from .router_utils import SllmRouter
 
-__all__ = ["SllmRouter", "RoundRobinRouter", "MigrationRouter"]
+__all__ = [
+    "SllmRouter",
+    "CpuModelRouter",
+    "RoundRobinRouter",
+    "MigrationRouter",
+]

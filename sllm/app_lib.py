@@ -34,7 +34,7 @@ def create_app() -> FastAPI:
         # ray.init()
         yield
         # Shutdown the Ray cluster
-        ray.shutdown()
+        # ray.shutdown()
 
     app = FastAPI(lifespan=lifespan)
 

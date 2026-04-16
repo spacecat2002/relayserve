@@ -39,6 +39,7 @@ def start_server(
     enable_migration=False,
 ):
     """Start the SLLM server using Ray and uvicorn."""
+    controller = None
     try:
         # Initialize Ray if not already initialized
         if not ray.is_initialized():
@@ -72,15 +73,23 @@ def start_server(
 
     except KeyboardInterrupt:
         click.echo("Shutting down SLLM server...")
-        try:
-            if "controller" in locals():
-                ray.get(controller.shutdown.remote())
-            click.echo("[✅] SLLM server shut down successfully")
-        except Exception as e:
-            click.echo(f"[⚠️] Warning during shutdown: {e}")
     except Exception as e:
         click.echo(f"[❌] Failed to start SLLM server: {e}")
         sys.exit(1)
+    finally:
+        if controller is None and ray.is_initialized():
+            try:
+                controller = ray.get_actor("controller")
+            except Exception:
+                controller = None
+        if controller is not None:
+            try:
+                ray.get(controller.shutdown.remote())
+                click.echo("[✅] SLLM server shut down successfully")
+            except Exception as e:
+                click.echo(f"[⚠️] Warning during shutdown: {e}")
+        if ray.is_initialized():
+            ray.shutdown()
 
 
 # ----------------------------- DEPLOY COMMAND ----------------------------- #

@@ -78,7 +78,7 @@ initialize_worker_node() {
     exit 1
   fi
 
-  RAY_RESOURCES='{"worker_node": 1, "worker_id_'$WORKER_ID'": 1}'
+  RAY_RESOURCES='{"worker_node": 1, "gpu_worker_'$WORKER_ID'": 1}'
 
   # Construct the command
   CMD="ray start --address=$RAY_HEAD_ADDRESS --resources='$RAY_RESOURCES'"
