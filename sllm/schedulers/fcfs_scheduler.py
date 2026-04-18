@@ -682,18 +682,6 @@ class FcfsScheduler(SllmScheduler):
                             )
                             break
 
-                    if allocation_info is None and self.auto_pipeline_split and tp_size * pp_size > 1:
-                        allocation_info = self._try_auto_pipeline_split_allocation(
-                            worker_nodes=worker_nodes,
-                            requested_tp=tp_size,
-                            requested_pp=pp_size,
-                            reserved_gpu_ids_by_node=reserved_gpu_ids_by_node,
-                            preferred_pp0_node_id=preferred_pp0_node_id,
-                            allow_stage_colocation=allow_stage_colocation,
-                            preferred_collocate_nodes=preferred_collocate_nodes,
-                            model_name=model_name,
-                        )
-
                     if allocation_info:
                         for stage in allocation_info.get("allocations", []):
                             stage_nid = stage.get("node_id")
@@ -769,56 +757,6 @@ class FcfsScheduler(SllmScheduler):
 
     def _max_hardware_gpus_per_node(self, worker_nodes: Mapping[str, Mapping]) -> int:
         return max((int(n.get("total_gpu", 0)) for n in worker_nodes.values()), default=0)
-
-    def _try_auto_pipeline_split_allocation(
-        self,
-        worker_nodes: Mapping[str, Mapping],
-        requested_tp: int,
-        requested_pp: int,
-        reserved_gpu_ids_by_node: Mapping[str, Set[int]],
-        preferred_pp0_node_id: Optional[str],
-        allow_stage_colocation: bool,
-        preferred_collocate_nodes: Optional[Set[str]],
-        model_name: str,
-    ) -> Optional[Dict]:
-        """Try alternative TP×PP factorisations with the same total GPU count.
-
-        Only considers splittings with pp_new ≥ 2.  Tries larger per-stage tp_new
-        first (up to per-node hardware width), skipping the originally-requested pair.
-        """
-        if requested_tp < 1 or requested_pp < 1:
-            return None
-        target = requested_tp * requested_pp
-        if target < 2:
-            return None
-        max_hw = self._max_hardware_gpus_per_node(worker_nodes)
-        if max_hw < 1:
-            return None
-        for tp_new in range(min(max_hw, target), 0, -1):
-            if target % tp_new != 0:
-                continue
-            pp_new = target // tp_new
-            if pp_new < 2:
-                continue
-            if tp_new == requested_tp and pp_new == requested_pp:
-                continue
-            alloc = self._allocate_pipeline_stages(
-                worker_nodes=worker_nodes,
-                tp_size=tp_new,
-                pp_size=pp_new,
-                reserved_gpu_ids_by_node=reserved_gpu_ids_by_node,
-                preferred_pp0_node_id=preferred_pp0_node_id,
-                allow_stage_colocation=allow_stage_colocation,
-                preferred_collocate_nodes=preferred_collocate_nodes,
-                model_name=model_name,
-            )
-            if alloc:
-                logger.info(
-                    "Auto pipeline split for model=%s: TP%s×PP%s → TP%s×PP%s",
-                    model_name, requested_tp, requested_pp, tp_new, pp_new,
-                )
-                return alloc
-        return None
 
     def _allocate_pipeline_stages(
         self,
@@ -940,6 +878,8 @@ class FcfsScheduler(SllmScheduler):
 
         for stage in stage_allocations:
             nid = stage["node_id"]
+            # Expose the node's IP address so the router can build PG node-affinity constraints.
+            stage["address"] = str(worker_nodes.get(nid, {}).get("address") or "")
             worker_nodes[nid]["remaining_gpu_slots"] = max(
                 0,
                 int(worker_nodes[nid].get("remaining_gpu_slots", 0)) - len(stage["gpu_ids"]),

@@ -24,6 +24,10 @@ import time
 import ray
 
 from sllm.logger import init_logger
+from sllm.loading_perf_profile import (
+    load_loading_perf_profile,
+    solve_lazy_load_method,
+)
 from sllm.routers import MigrationRouter, RoundRobinRouter
 from sllm.schedulers import FcfsScheduler
 from sllm.utils import TokenizerWrapper
@@ -34,6 +38,7 @@ logger = init_logger(__name__)
 class SllmController:
     def __init__(self, config: Optional[Mapping] = None):
         self.config = dict(config or {})
+        self.loading_perf_profile = load_loading_perf_profile()
 
         self.running_lock = asyncio.Lock()
         self.running = False
@@ -56,35 +61,14 @@ class SllmController:
     ) -> List[Any]:
         model_config = self.registered_models.get(model_name, {})
         backend_config = dict(model_config.get("backend_config", {}))
-        policy = dict(backend_config.get("load_method_policy", {}))
-        default_method = backend_config.get("load_method", "tokenwise")
-
-        tokenwise_models = set(policy.get("tokenwise_models", []))
-        layerwise_models = set(policy.get("layerwise_models", []))
-        tokenwise_max_prompt_len = int(policy.get("tokenwise_max_prompt_len", 1024))
-        layerwise_min_prompt_len = int(policy.get("layerwise_min_prompt_len", 2048))
-
-        if model_name in tokenwise_models or input_length <= tokenwise_max_prompt_len:
-            method = "tokenwise"
-        elif model_name in layerwise_models or input_length >= layerwise_min_prompt_len:
-            method = "layerwise"
-        else:
-            method = default_method
-
-        layer_idxes = list(backend_config.get("layer_idxes", []))
-        if not layer_idxes:
-            end_layer = int(backend_config.get("layerwise_end_layer", -1))
-            if end_layer >= 0:
-                layer_idxes = list(range(end_layer + 1))
-
-        if method == "layerwise":
-            computing_layers = len(layer_idxes)
-            return [method, computing_layers, layer_idxes]
-
-        cpu_compute_tokens = input_length
-        if tokenwise_max_prompt_len > 0:
-            cpu_compute_tokens = min(input_length, tokenwise_max_prompt_len)
-        return [method, cpu_compute_tokens, layer_idxes]
+        solved = solve_lazy_load_method(
+            self.loading_perf_profile,
+            model_name,
+            input_length,
+            backend_config,
+            model_config,
+        )
+        return solved
 
     async def start(self):
         async with self.running_lock:
@@ -224,7 +208,7 @@ class SllmController:
                 cpu_result = await cpu_router.inference.remote(
                     request_data=request_data, action="generate"
                 )
-                await gpu_router.ensure_empty_instance.remote()
+                await gpu_router.ensure_one_instance.remote()
                 return cpu_result
 
         # ---- Resolve the node hosting this model's GPU instance ---- #
@@ -270,16 +254,6 @@ class SllmController:
 
         # Determine cold-start strategy
         methods = self._generate_lazy_load_method(model_name, input_length)
-        if force_amx_assisted_cold_start:
-            tokenwise_max_prompt_len = int(
-                model_cfg.get("backend_config", {})
-                .get("load_method_policy", {})
-                .get("tokenwise_max_prompt_len", 1024)
-            )
-            cpu_compute_tokens = input_length
-            if tokenwise_max_prompt_len > 0:
-                cpu_compute_tokens = min(input_length, tokenwise_max_prompt_len)
-            methods = ["tokenwise", cpu_compute_tokens, methods[2]]
         cpu_instance = await cpu_router.get_instance.remote()
         if cpu_instance is None or cpu_instance.backend_instance is None:
             return {"error": "CPU instance not available"}

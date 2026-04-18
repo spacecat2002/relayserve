@@ -20,7 +20,7 @@ import logging
 import time
 import uuid
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 
@@ -54,6 +54,61 @@ def start_instance(
         lifetime="detached",
     ).remote(instance_id, model_name, device, backend_config, runtime_env)
 
+async def _build_pp_placement_group(
+    allocations: List[Dict[str, Any]], tp_size: int
+) -> Optional[Any]:
+    """Create a Ray PlacementGroup that pins each PP stage to its designated node.
+
+    Bundle layout (strategy=PACK):
+      - Bundle 0 : {"CPU": 1, "node:<stage0_IP>": 0.001}
+        → coordinator (GPUBackend actor + start_instance task)
+      - Bundles 1 .. tp_size : {"GPU": 1.0, "node:<stage0_IP>": 0.001}
+        → stage-0 GPU workers (vLLM)
+      - Bundles tp_size+1 .. 2*tp_size : {"GPU": 1.0, "node:<stage1_IP>": 0.001}
+        → stage-1 GPU workers (vLLM)
+      - … one block of tp_size GPU bundles per PP stage …
+    """
+    try:
+        from ray.util.placement_group import placement_group as ray_placement_group
+    except ImportError:
+        logger.error("ray.util.placement_group unavailable; cannot build PP placement group")
+        return None
+
+    if not allocations:
+        return None
+
+    stage0_addr = allocations[0].get("address", "")
+    if stage0_addr:
+        bundles: List[Dict[str, Any]] = [{"CPU": 1, f"node:{stage0_addr}": 0.001}]
+    else:
+        logger.warning(
+            "PP placement group: stage-0 node address unknown; "
+            "coordinator bundle is not node-pinned"
+        )
+        bundles = [{"CPU": 1}]
+
+    for stage in allocations:
+        addr = stage.get("address", "")
+        for _ in range(tp_size):
+            if addr:
+                bundles.append({"GPU": 1.0, f"node:{addr}": 0.001})
+            else:
+                logger.warning(
+                    "PP placement group: stage %d address unknown; GPU bundle is not node-pinned",
+                    stage.get("stage_idx", -1),
+                )
+                bundles.append({"GPU": 1.0})
+
+    logger.info(
+        "Creating PP placement group with %d bundles (1 CPU coordinator + %d GPU workers): %s",
+        len(bundles), len(bundles) - 1, bundles,
+    )
+    pg = ray_placement_group(bundles, strategy="PACK")
+    await pg.ready()
+    logger.info("PP placement group is ready")
+    return pg
+
+
 async def auto_scaler(
     auto_scaling_metrics: Dict[str, int], auto_scaling_config: Dict[str, int]
 ) -> int:
@@ -75,6 +130,22 @@ async def auto_scaler(
     )
 
     return desired_instances
+
+
+def _remove_placement_group(instance: "InstanceHandle", instance_id: str) -> None:
+    """Best-effort removal of a Ray PlacementGroup stored on *instance*."""
+    pg = instance.placement_group
+    if pg is None:
+        return
+    try:
+        from ray.util.placement_group import remove_placement_group
+        remove_placement_group(pg)
+        instance.placement_group = None
+        logger.info("Removed placement group for instance %s", instance_id)
+    except Exception as exc:
+        logger.warning(
+            "Failed to remove placement group for instance %s: %s", instance_id, exc
+        )
 
 
 class RoundRobinRouter(SllmRouter):
@@ -213,32 +284,131 @@ class RoundRobinRouter(SllmRouter):
         backend_config = dict(self.backend_config)
         if instance.empty_instance:
             backend_config["lazy_load"] = True
+        else:
+            backend_config["lazy_load"] = False
+
         if self.device == "gpu":
             scheduler_resources = dict(self.resource_requirements)
             scheduler_resources["empty_instance"] = instance.empty_instance
-            tp_size = int(self.resource_requirements.get("num_gpus", 1))
-            if tp_size > 1:
-                scheduler_resources["tp_size"] = tp_size
+
+            # Derive pp_size / tp_size from backend_config so the scheduler can plan
+            # multi-node pipeline stages correctly.
+            total_gpus = int(self.resource_requirements.get("num_gpus", 1))
+            pp_size = int(
+                self.backend_config.get(
+                    "pipeline_parallel_size",
+                    self.resource_requirements.get("pipeline_parallel_size", 1),
+                )
+                or 1
+            )
+            tp_size_cfg = int(self.backend_config.get("tensor_parallel_size", 0) or 0)
+            if tp_size_cfg > 0:
+                scheduler_resources["tp_size"] = tp_size_cfg
+            elif total_gpus > 1:
+                # Infer per-stage TP from total GPU count divided by PP stages.
+                scheduler_resources["tp_size"] = max(1, total_gpus // max(pp_size, 1))
+            if pp_size > 1:
+                scheduler_resources["pipeline_parallel_size"] = pp_size
             if instance.empty_instance:
                 scheduler_resources["num_gpus"] = 0.001
             if instance.preferred_gpu_ids:
                 scheduler_resources["preferred_gpu_ids"] = instance.preferred_gpu_ids
-            
+
             allocation_info = await self.model_loading_scheduler.allocate_resource.remote(
                 self.model_name, instance_id, scheduler_resources
             )
-            gpu_ids = []
+
+            # Decode what the scheduler actually allocated.
             if isinstance(allocation_info, dict):
                 startup_node = allocation_info.get("node_id")
                 gpu_ids = allocation_info.get("gpu_ids", [])
+                actual_pp = int(allocation_info.get("pipeline_parallel_size", 1))
+                actual_tp = int(allocation_info.get("tensor_parallel_size", 1))
+                stage_allocations = allocation_info.get("allocations", [])
             else:
                 startup_node = allocation_info
-            
+                gpu_ids = []
+                actual_pp = 1
+                actual_tp = 1
+                stage_allocations = []
+
+            # ------------------------------------------------------------------ #
+            #  Pipeline-parallel path: build a Placement Group that pins each    #
+            #  stage to its designated Ray node.                                  #
+            # ------------------------------------------------------------------ #
+            if actual_pp > 1 and stage_allocations:
+                logger.info(
+                    "Instance %s is PP=%d TP=%d; building placement group for stages: %s",
+                    instance_id, actual_pp, actual_tp,
+                    [(s.get("stage_idx"), s.get("node_id"), s.get("address")) for s in stage_allocations],
+                )
+                from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+                pg = await _build_pp_placement_group(stage_allocations, actual_tp)
+                if pg is None:
+                    logger.error(
+                        "Failed to build PP placement group for instance %s; aborting", instance_id
+                    )
+                    return
+
+                async with instance.lock:
+                    instance.placement_group = pg
+                    instance.node_id = startup_node
+
+                # The GPUBackend actor lands on bundle 0 (CPU coordinator on stage-0 node).
+                # With capture_child_tasks=True, vLLM's GPU worker actors are automatically
+                # placed in the remaining GPU bundles (1 … tp_size*pp_size).
+                pg_strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=0,
+                    placement_group_capture_child_tasks=True,
+                )
+                startup_config = {
+                    "num_cpus": 0,
+                    "num_gpus": 0,
+                    "scheduling_strategy": pg_strategy,
+                    # No runtime_env: Ray assigns CUDA_VISIBLE_DEVICES per worker via PG.
+                }
+
+                logger.info("Startup config (PP/PG): %s", startup_config)
+                await start_instance.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=0,
+                        placement_group_capture_child_tasks=True,
+                    )
+                ).remote(
+                    instance_id,
+                    self.backend,
+                    self.model_name,
+                    backend_config,
+                    startup_config,
+                    self.device,
+                )
+
+                logger.info("Started PP instance %s for model %s", instance_id, self.model_name)
+                instance.backend_instance = ray.get_actor(instance_id)
+                async with instance.lock:
+                    instance.ready = True
+                await instance.backend_instance.init_backend.remote()
+
+                async with self.instance_management_lock:
+                    self.ready_inference_instances[instance_id] = instance
+                    self.starting_inference_instances.pop(instance_id)
+                    lazy_load = backend_config.get("lazy_load", False)
+                    self.instance_to_load_status[instance_id] = not lazy_load
+
+                return instance_id
+
+            # ------------------------------------------------------------------ #
+            #  TP-only (single-node) path: use custom Ray resource constraints.  #
+            # ------------------------------------------------------------------ #
             startup_resources = {
                 "gpu_worker_node": 0.001,
                 f"worker_id_{startup_node}": 0.001,
             }
             num_gpus = 0.001
+
         else:
             startup_node = None
             gpu_ids = []
@@ -246,6 +416,7 @@ class RoundRobinRouter(SllmRouter):
                 "cpu_worker_node": 0.001,
             }
             num_gpus = 0
+
         startup_config = {
             "resources": startup_resources,
             "num_gpus": num_gpus,
@@ -274,7 +445,7 @@ class RoundRobinRouter(SllmRouter):
             instance.ready = True
             instance.node_id = startup_node
         await instance.backend_instance.init_backend.remote()
-        
+
         # Get visible devices and store in instance handle
         if self.device == "gpu":
             gpu_ids = await instance.backend_instance.get_visible_devices.remote()
@@ -362,7 +533,7 @@ class RoundRobinRouter(SllmRouter):
             instance = self.deleting_inference_instances.pop(instance_id)
         async with instance.lock:
             instance.status = False
-        
+
         # Release GPU lock if held
         if self.device == "gpu" and instance.gpu_locked and instance.gpu_group and instance.node_id:
             try:
@@ -382,6 +553,7 @@ class RoundRobinRouter(SllmRouter):
                 instance_id,
                 self._build_deallocate_resources(instance),
             )
+        _remove_placement_group(instance, instance_id)
 
     async def _shutdown_instance(self, instance_id: str):
         logger.info(
@@ -415,6 +587,7 @@ class RoundRobinRouter(SllmRouter):
                 instance_id,
                 self._build_deallocate_resources(instance),
             )
+        _remove_placement_group(instance, instance_id)
         return
 
     async def lazy_load_weights(
@@ -534,14 +707,14 @@ class RoundRobinRouter(SllmRouter):
             "empty_starting": len(empty_starting),
         }
 
-    async def ensure_empty_instance(self) -> bool:
-        """Ensure at least one empty GPU instance exists or is starting. Returns True if created."""
+    async def ensure_one_instance(self) -> bool:
+        """Ensure at least one GPU instance exists or is starting. Returns True if created."""
         if self.device != "gpu":
             return False
         status = await self.get_instance_pool_status()
         if status["empty_ready"] > 0 or status["empty_starting"] > 0:
             return False
-        await self._create_instance(empty_instance=True)
+        await self._create_instance(empty_instance=False)
         return True
 
     async def get_instance(self):
@@ -639,6 +812,7 @@ class RoundRobinRouter(SllmRouter):
                     instance_id,
                     exc,
                 )
+        _remove_placement_group(instance, instance_id)
 
     async def shutdown(self):
         async with self.running_lock:

@@ -76,7 +76,7 @@ def build_gpu_router_mock(
 
     ee = MagicMock()
     ee.remote = AsyncMock(return_value=False)
-    gpu.ensure_empty_instance = ee
+    gpu.ensure_one_instance = ee
     return gpu
 
 
@@ -232,7 +232,7 @@ async def test_cpu_only_then_ensure_empty_when_loaded_but_saturated_no_prewarm(
     out = await ctrl.generate_stream(model, {"prompt": "x", "request_id": "r2"})
     assert out == {"ok": True, "path": "cpu_only"}
     cpu.inference.remote.assert_called_once()
-    gpu.ensure_empty_instance.remote.assert_called_once()
+    gpu.ensure_one_instance.remote.assert_called_once()
 
 
 @pytest.mark.asyncio

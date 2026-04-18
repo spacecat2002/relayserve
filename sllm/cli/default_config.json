@@ -31,13 +31,6 @@
         "cpu_placement_node_id": null,
         "cpu_placement_resources": null,
         "cpu_placement_disable_round_robin": false,
-        "load_method_policy": {
-            "tokenwise_max_prompt_len": 1024,
-            "layerwise_min_prompt_len": 2048,
-            "layerwise_models": [],
-            "tokenwise_models": []
-        },
-
         "shm_tp_size": 2,
         "shm_size": 4293918720,
         "shm_num_blocks": 455,

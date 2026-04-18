@@ -20,7 +20,8 @@ import os
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
+import pybind11
+from setuptools import Extension, find_packages, setup
 
 ROOT_DIR = os.path.dirname(__file__)
 
@@ -48,26 +49,24 @@ def read_readme() -> str:
     else:
         return ""
 
-
-install_requires = fetch_requirements("requirements.txt")
-install_requires_worker = fetch_requirements("requirements-worker.txt")
-
-extras = {}
-extras["test"] = install_requires_worker + ["pytest", "pytest-asyncio"]
-extras["worker"] = install_requires_worker
-
 sys.path.append(Path.cwd().as_posix())
+
+loading_perf_solver_extension = Extension(
+    "sllm._loading_perf_profile_solver",
+    sources=["sllm/routers/loading_perf_profile_solver.cpp"],
+    include_dirs=[pybind11.get_include()],
+    language="c++",
+    extra_compile_args=["-O3", "-std=c++17"],
+)
 
 setup(
     name="serverless-llm",
-    version="0.8.0",
-    install_requires=install_requires,
+    version="0.1.0",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    extras_require=extras,
     entry_points={
         "console_scripts": [
-            "sllm = sllm.cli.clic:cli",
+            "sllm = sllm.cli.cli_commands:cli",
         ],
     },
     include_package_data=True,
@@ -75,4 +74,5 @@ setup(
         "sllm.cli": ["default_config.json"],
     },
     packages=find_packages(),
+    ext_modules=[loading_perf_solver_extension],
 )
